@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import subprocess
 import sys
 import threading
@@ -12,6 +13,59 @@ from PIL import Image, ImageDraw
 
 import app as backend
 
+ERROR_ALREADY_EXISTS = 183
+
+
+class SingleInstanceGuard:
+    def __init__(self, name: str):
+        self.name = name
+        self.handle = None
+
+    def acquire(self) -> bool:
+        if not sys.platform.startswith("win"):
+            return True
+        self.handle = ctypes.windll.kernel32.CreateMutexW(None, False, self.name)
+        if not self.handle:
+            return True
+        return ctypes.GetLastError() != ERROR_ALREADY_EXISTS
+
+    def release(self) -> None:
+        if not self.handle:
+            return
+        ctypes.windll.kernel32.CloseHandle(self.handle)
+        self.handle = None
+
+
+def desktop_url(port: int) -> str:
+    return f"http://{backend.get_lan_ip()}:{port}/?role=desktop"
+
+
+def service_health_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}/health"
+
+
+def service_is_ready(port: int, timeout: float = 4.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(service_health_url(port), timeout=1.0) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
+
+def show_popup(message: str, title: str = "LAN 文件传输") -> None:
+    if not sys.platform.startswith("win"):
+        print(f"{title}: {message}")
+        return
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, title, 0x40)
+    except Exception:
+        print(f"{title}: {message}")
+
 
 class TrayController:
     def __init__(self, port: int, save_dir: Path):
@@ -22,10 +76,10 @@ class TrayController:
         self.lock = threading.Lock()
 
     def desktop_url(self) -> str:
-        return f"http://{backend.get_lan_ip()}:{self.port}/?role=desktop"
+        return desktop_url(self.port)
 
     def health_url(self) -> str:
-        return f"http://127.0.0.1:{self.port}/health"
+        return service_health_url(self.port)
 
     def backend_command(self) -> list[str]:
         args = [
@@ -166,7 +220,19 @@ def main() -> None:
         )
         return
 
-    TrayController(port=args.port, save_dir=save_dir).run()
+    guard = SingleInstanceGuard(f"LANFileTransfer.Tray.{args.port}")
+    if not guard.acquire():
+        if service_is_ready(args.port, timeout=6.0):
+            webbrowser.open(desktop_url(args.port), new=1)
+            show_popup("程序已在运行，已为你打开传输页面。")
+        else:
+            show_popup("程序已在运行，请在系统托盘中操作。")
+        return
+
+    try:
+        TrayController(port=args.port, save_dir=save_dir).run()
+    finally:
+        guard.release()
 
 
 if __name__ == "__main__":
