@@ -8,3 +8,6 @@ __pycache__/
 .idea/
 .vscode/
 received_files/
+dist/
+build/pyinstaller/
+*.spec

@@ -2,13 +2,16 @@ import argparse
 import base64
 import io
 import json
+import os
 import socket
+import sys
 import threading
 import time
 import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 from flask_sock import Sock
@@ -50,8 +53,39 @@ def build_qr_data_url(url: str) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-def create_app(upload_dir: Path, mobile_url: str) -> Flask:
-    app = Flask(__name__)
+def runtime_template_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass) / "templates"
+    return Path(__file__).resolve().parent / "templates"
+
+
+def default_save_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        local_appdata = os.getenv("LOCALAPPDATA")
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return base / "LANFileTransfer" / "received_files"
+    return Path(__file__).resolve().parent / "received_files"
+
+
+def resolve_save_dir(raw_save_dir: Optional[str]) -> Path:
+    if not raw_save_dir:
+        return default_save_dir().resolve()
+
+    save_dir = Path(raw_save_dir)
+    if save_dir.is_absolute():
+        return save_dir.resolve()
+
+    if getattr(sys, "frozen", False):
+        return (default_save_dir().parent / save_dir).resolve()
+
+    base_dir = Path(__file__).resolve().parent
+    return (base_dir / save_dir).resolve()
+
+
+def create_app(upload_dir: Path, mobile_url: str, template_dir: Optional[Path] = None) -> Flask:
+    app = Flask(__name__, template_folder=str(template_dir or runtime_template_dir()))
     app.config["UPLOAD_DIR"] = upload_dir
     app.config["JSON_AS_ASCII"] = False
     app.config["MOBILE_URL"] = mobile_url
@@ -194,37 +228,57 @@ def create_app(upload_dir: Path, mobile_url: str) -> Flask:
     return app
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="LAN file transfer server")
-    parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--save-dir", default="received_files")
-    args = parser.parse_args()
-
-    base_dir = Path(__file__).resolve().parent
-    upload_dir = (base_dir / args.save_dir).resolve()
+def start_server(
+    port: int = 5000,
+    save_dir: Optional[Path] = None,
+    auto_open_browser: bool = True,
+    print_terminal_qr: bool = True,
+) -> None:
+    upload_dir = (save_dir or default_save_dir()).resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     lan_ip = get_lan_ip()
-    base_url = f"http://{lan_ip}:{args.port}"
+    base_url = f"http://{lan_ip}:{port}"
     mobile_url = f"{base_url}/?role=mobile"
     desktop_url = f"{base_url}/?role=desktop"
 
-    print(f"Save directory: {upload_dir}")
-    print(f"Open in browser (desktop): {desktop_url}")
-    print(f"QR target (mobile): {mobile_url}")
-    print_qr(mobile_url)
+    if print_terminal_qr:
+        print(f"Save directory: {upload_dir}")
+        print(f"Open in browser (desktop): {desktop_url}")
+        print(f"QR target (mobile): {mobile_url}")
+        print_qr(mobile_url)
 
-    def open_desktop_page() -> None:
-        time.sleep(1.0)
-        try:
-            webbrowser.open(desktop_url, new=1)
-        except Exception as exc:
-            print(f"Auto-open browser skipped: {exc}")
+    if auto_open_browser:
+        def open_desktop_page() -> None:
+            time.sleep(1.0)
+            try:
+                webbrowser.open(desktop_url, new=1)
+            except Exception as exc:
+                print(f"Auto-open browser skipped: {exc}")
 
-    threading.Thread(target=open_desktop_page, daemon=True).start()
+        threading.Thread(target=open_desktop_page, daemon=True).start()
 
     app = create_app(upload_dir, mobile_url)
-    app.run(host="0.0.0.0", port=args.port, threaded=True)
+    app.run(host="0.0.0.0", port=port, threaded=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="LAN file transfer server")
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--save-dir", default=None, help="保存目录（默认自动选择）")
+    parser.add_argument("--no-browser", action="store_true", help="启动时不自动打开电脑端页面")
+    parser.add_argument("--no-terminal-qr", action="store_true", help="不在终端打印二维码")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    start_server(
+        port=args.port,
+        save_dir=resolve_save_dir(args.save_dir),
+        auto_open_browser=not args.no_browser,
+        print_terminal_qr=not args.no_terminal_qr,
+    )
 
 
 if __name__ == "__main__":
