@@ -1,0 +1,21 @@
+Role: 全栈开发专家（Python/Node.js + Modern Web）。
+
+Task: 开发一个无需安装App的局域网文件传输系统。
+
+Architecture:
+
+Server (PC端): 运行一个轻量级 Web Server。
+启动时自动获取本机局域网 IP。
+在控制台生成一个二维码（将 http://IP:PORT 转为二维码）。
+Client (手机端): 手机扫码后，通过浏览器访问 Web 界面。
+Key Features & UX:
+
+界面设计: 手机端界面要类似聊天窗口。底部有“发送文件”按钮，中间显示传输记录。
+文件上传: 使用 AJAX/Fetch API 实现无刷新上传。
+文件下载: 电脑端接收到文件后，自动保存到指定文件夹；电脑端也可以往网页拖拽文件，手机端网页弹出下载提示。
+防中断机制: 前端通过 JavaScript 监听 visibilitychange 事件，如果用户切后台，尝试通过 Notification API 或 保持 WebSocket 心跳来防止连接中断（尽最大努力）。
+Tech Stack:
+
+后端: Python (Flask) 或 Node.js (Express)。
+前端: 单个 HTML 文件（包含 CSS/JS），方便部署。
+Output: 请提供完整的代码实现，并解释如何处理大文件上传时的内存占用问题（例如使用流式传输）。
