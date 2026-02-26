@@ -16,6 +16,12 @@ import app as backend
 ERROR_ALREADY_EXISTS = 183
 
 
+def resource_path(filename: str) -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / filename
+    return Path(__file__).resolve().parent / filename
+
+
 class SingleInstanceGuard:
     def __init__(self, name: str):
         self.name = name
@@ -189,6 +195,12 @@ class TrayController:
 
 
 def build_tray_icon(size: int = 64) -> Image.Image:
+    logo_file = resource_path("logos.png")
+    if logo_file.exists():
+        try:
+            return Image.open(logo_file).convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+        except Exception:
+            pass
     image = Image.new("RGB", (size, size), (30, 58, 95))
     draw = ImageDraw.Draw(image)
     pad = 10
