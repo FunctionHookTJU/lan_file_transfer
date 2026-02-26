@@ -3,7 +3,9 @@ import base64
 import io
 import json
 import os
+import secrets
 import socket
+import string
 import sys
 import threading
 import time
@@ -13,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, jsonify, make_response, render_template, request, send_file
 from flask_sock import Sock
 from qrcode import QRCode
 from werkzeug.utils import secure_filename
@@ -84,18 +86,65 @@ def resolve_save_dir(raw_save_dir: Optional[str]) -> Path:
     return (base_dir / save_dir).resolve()
 
 
-def create_app(upload_dir: Path, mobile_url: str, template_dir: Optional[Path] = None) -> Flask:
+def create_app(
+    upload_dir: Path,
+    base_url: str,
+    lan_ip: str,
+    initial_mobile_token: str,
+    token_ttl_seconds: int = 120,
+    template_dir: Optional[Path] = None,
+) -> Flask:
     app = Flask(__name__, template_folder=str(template_dir or runtime_template_dir()))
     app.config["UPLOAD_DIR"] = upload_dir
     app.config["JSON_AS_ASCII"] = False
-    app.config["MOBILE_URL"] = mobile_url
-    app.config["MOBILE_QR_DATA_URL"] = build_qr_data_url(mobile_url)
+    app.config["BASE_URL"] = base_url
+    app.config["TOKEN_TTL_SECONDS"] = token_ttl_seconds
 
     sock = Sock(app)
     records = []
     record_map = {}
     clients = set()
     lock = threading.Lock()
+    trusted_desktop_ips = {"127.0.0.1", "::1", lan_ip}
+    token_state = {
+        "token": initial_mobile_token,
+        "expires_at": time.time() + token_ttl_seconds,
+        "consumed": False,
+    }
+    sessions = {}
+
+    def random_token(length: int = 12) -> str:
+        alphabet = string.ascii_letters + string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(length))
+
+    def issue_token(force_new: bool = False) -> tuple[str, float]:
+        with lock:
+            now = time.time()
+            should_reuse = (
+                not force_new
+                and token_state["token"]
+                and not token_state["consumed"]
+                and token_state["expires_at"] > now
+            )
+            if should_reuse:
+                return token_state["token"], token_state["expires_at"]
+
+            token_state["token"] = random_token()
+            token_state["expires_at"] = now + token_ttl_seconds
+            token_state["consumed"] = False
+            return token_state["token"], token_state["expires_at"]
+
+    def mobile_url_from_token(token: str) -> str:
+        return f"{app.config['BASE_URL']}/?token={token}"
+
+    def get_mobile_qr_payload(force_new: bool = False) -> dict:
+        token, expires_at = issue_token(force_new=force_new)
+        url = mobile_url_from_token(token)
+        return {
+            "mobile_url": url,
+            "mobile_qr_data_url": build_qr_data_url(url),
+            "token_expires_at": int(expires_at),
+        }
 
     def public_record(record: dict) -> dict:
         return {
@@ -133,22 +182,174 @@ def create_app(upload_dir: Path, mobile_url: str, template_dir: Optional[Path] =
                 for ws in dead:
                     clients.discard(ws)
 
+    def is_trusted_desktop(ip: Optional[str]) -> bool:
+        return bool(ip and ip in trusted_desktop_ips)
+
+    def read_session_id() -> Optional[str]:
+        return (
+            request.headers.get("X-Session-Id")
+            or request.args.get("session_id")
+            or request.cookies.get("lft_session")
+        )
+
+    def get_valid_session(session_id: Optional[str], ip: Optional[str]) -> Optional[dict]:
+        if not session_id:
+            return None
+
+        with lock:
+            session = sessions.get(session_id)
+            if session is None:
+                return None
+            if session["ip"] != ip:
+                return None
+            session["last_seen_at"] = int(time.time())
+            return session
+
+    def consume_token_and_issue_session(token: str, ip: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        if not token:
+            return None, "缺少一次性令牌"
+        if not ip:
+            return None, "无法识别设备地址"
+
+        with lock:
+            now = time.time()
+            if token_state["token"] != token:
+                return None, "令牌无效"
+            if token_state["consumed"]:
+                return None, "令牌已失效"
+            if token_state["expires_at"] <= now:
+                return None, "令牌已过期"
+
+            token_state["consumed"] = True
+            session_id = uuid.uuid4().hex
+            sessions[session_id] = {
+                "id": session_id,
+                "ip": ip,
+                "created_at": int(now),
+                "last_seen_at": int(now),
+            }
+            return session_id, None
+
+    def authorize_request() -> bool:
+        ip = request.remote_addr
+        if is_trusted_desktop(ip):
+            return True
+        session_id = read_session_id()
+        return get_valid_session(session_id, ip) is not None
+
     @app.get("/")
     def index():
+        ip = request.remote_addr
+        role = request.args.get("role")
+        token = request.args.get("token", "")
+        session_id = read_session_id()
+        valid_session = get_valid_session(session_id, ip)
+
+        if token:
+            if valid_session is not None:
+                active_session_id = valid_session["id"]
+            else:
+                active_session_id, error = consume_token_and_issue_session(token, ip)
+                if active_session_id is None:
+                    return make_response(
+                        render_template(
+                            "index.html",
+                            access_denied=True,
+                            access_denied_reason=error,
+                            role_hint="mobile",
+                            session_id="",
+                            mobile_url="",
+                            mobile_qr_data_url="",
+                            token_expires_at=0,
+                        ),
+                        403,
+                    )
+
+            response = make_response(
+                render_template(
+                    "index.html",
+                    access_denied=False,
+                    access_denied_reason="",
+                    role_hint="mobile",
+                    session_id=active_session_id,
+                    mobile_url="",
+                    mobile_qr_data_url="",
+                    token_expires_at=0,
+                )
+            )
+            response.set_cookie("lft_session", active_session_id, httponly=False, samesite="Lax")
+            return response
+
+        if role == "mobile":
+            if valid_session is None:
+                return make_response(
+                    render_template(
+                        "index.html",
+                        access_denied=True,
+                        access_denied_reason="请重新扫码获取一次性登录令牌。",
+                        role_hint="mobile",
+                        session_id="",
+                        mobile_url="",
+                        mobile_qr_data_url="",
+                        token_expires_at=0,
+                    ),
+                    403,
+                )
+
+            return make_response(
+                render_template(
+                    "index.html",
+                    access_denied=False,
+                    access_denied_reason="",
+                    role_hint="mobile",
+                    session_id=valid_session["id"],
+                    mobile_url="",
+                    mobile_qr_data_url="",
+                    token_expires_at=0,
+                )
+            )
+
+        if not is_trusted_desktop(ip):
+            return make_response(
+                render_template(
+                    "index.html",
+                    access_denied=True,
+                    access_denied_reason="未授权访问：请使用电脑端二维码扫码登录。",
+                    role_hint="mobile",
+                    session_id="",
+                    mobile_url="",
+                    mobile_qr_data_url="",
+                    token_expires_at=0,
+                ),
+                403,
+            )
+
+        qr_payload = get_mobile_qr_payload(force_new=False)
         return render_template(
             "index.html",
-            mobile_url=app.config["MOBILE_URL"],
-            mobile_qr_data_url=app.config["MOBILE_QR_DATA_URL"],
+            access_denied=False,
+            access_denied_reason="",
+            role_hint="desktop",
+            session_id="",
+            mobile_url=qr_payload["mobile_url"],
+            mobile_qr_data_url=qr_payload["mobile_qr_data_url"],
+            token_expires_at=qr_payload["token_expires_at"],
         )
 
     @app.get("/records")
     def get_records():
+        if not authorize_request():
+            return jsonify({"error": "未授权访问"}), 401
+
         with lock:
             data = [public_record(r) for r in records]
         return jsonify({"records": data})
 
     @app.post("/upload")
     def upload_file():
+        if not authorize_request():
+            return jsonify({"error": "未授权访问"}), 401
+
         uploaded = request.files.get("file")
         source = request.form.get("source", "mobile")
 
@@ -186,6 +387,9 @@ def create_app(upload_dir: Path, mobile_url: str, template_dir: Optional[Path] =
 
     @app.get("/files/<transfer_id>")
     def download_file(transfer_id: str):
+        if not authorize_request():
+            return jsonify({"error": "未授权访问"}), 401
+
         with lock:
             record = record_map.get(transfer_id)
 
@@ -203,8 +407,18 @@ def create_app(upload_dir: Path, mobile_url: str, template_dir: Optional[Path] =
     def health():
         return jsonify({"status": "ok"})
 
+    @app.get("/auth/mobile-token")
+    def get_mobile_token():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可刷新二维码"}), 403
+        return jsonify(get_mobile_qr_payload(force_new=True))
+
     @sock.route("/ws")
     def ws_handler(ws):
+        if not authorize_request():
+            ws.close()
+            return
+
         with lock:
             clients.add(ws)
             init_records = [public_record(r) for r in records]
@@ -239,7 +453,8 @@ def start_server(
 
     lan_ip = get_lan_ip()
     base_url = f"http://{lan_ip}:{port}"
-    mobile_url = f"{base_url}/?role=mobile"
+    initial_mobile_token = uuid.uuid4().hex
+    mobile_url = f"{base_url}/?token={initial_mobile_token}"
     desktop_url = f"{base_url}/?role=desktop"
 
     if print_terminal_qr:
@@ -258,7 +473,12 @@ def start_server(
 
         threading.Thread(target=open_desktop_page, daemon=True).start()
 
-    app = create_app(upload_dir, mobile_url)
+    app = create_app(
+        upload_dir=upload_dir,
+        base_url=base_url,
+        lan_ip=lan_ip,
+        initial_mobile_token=initial_mobile_token,
+    )
     app.run(host="0.0.0.0", port=port, threaded=True)
 
 

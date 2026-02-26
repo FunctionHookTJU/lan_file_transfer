@@ -105,6 +105,13 @@
       gap: 6px;
     }
 
+    .qr-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
     .qr-title {
       font-size: 13px;
       font-weight: 600;
@@ -119,6 +126,16 @@
     }
 
     .qr-link:hover { text-decoration: underline; }
+
+    .qr-expire {
+      font-size: 12px;
+      color: #465a6f;
+    }
+
+    .btn.qr-refresh {
+      padding: 4px 8px;
+      font-size: 12px;
+    }
 
     .records {
       flex: 1;
@@ -272,6 +289,10 @@
       <div class="qr-text">
         <div class="qr-title">手机扫码打开上传页</div>
         <a class="qr-link" id="qrLink" target="_blank" rel="noopener noreferrer"></a>
+        <div class="qr-meta">
+          <span class="qr-expire" id="qrExpire">有效期剩余 --</span>
+          <button class="btn qr-refresh" id="refreshQrBtn" type="button">刷新二维码</button>
+        </div>
       </div>
     </div>
 
@@ -294,6 +315,10 @@
     const serverConfig = {
       mobileUrl: {{ mobile_url|tojson }},
       mobileQrDataUrl: {{ mobile_qr_data_url|tojson }},
+      tokenExpiresAt: {{ token_expires_at|tojson }},
+      sessionId: {{ session_id|tojson }},
+      accessDenied: {{ access_denied|tojson }},
+      accessDeniedReason: {{ access_denied_reason|tojson }},
     };
 
     const state = {
@@ -303,6 +328,10 @@
       reconnectTimer: null,
       records: [],
       recordIdSet: new Set(),
+      sessionId: serverConfig.sessionId || '',
+      qrExpiresAt: Number(serverConfig.tokenExpiresAt || 0),
+      qrRefreshInFlight: false,
+      qrCountdownTimer: null,
     };
 
     const ui = {
@@ -318,6 +347,8 @@
       qrCard: document.getElementById('qrCard'),
       qrImage: document.getElementById('qrImage'),
       qrLink: document.getElementById('qrLink'),
+      qrExpire: document.getElementById('qrExpire'),
+      refreshQrBtn: document.getElementById('refreshQrBtn'),
     };
 
     function detectRole() {
@@ -411,11 +442,76 @@
 
     function triggerDownload(record) {
       const link = document.createElement('a');
-      link.href = record.download_url;
+      link.href = withSession(record.download_url);
       link.download = record.name;
       document.body.appendChild(link);
       link.click();
       link.remove();
+    }
+
+    function withSession(url) {
+      if (!state.sessionId) return url;
+      const u = new URL(url, location.origin);
+      u.searchParams.set('session_id', state.sessionId);
+      return u.pathname + u.search;
+    }
+
+    function authHeaders() {
+      if (!state.sessionId) return {};
+      return { 'X-Session-Id': state.sessionId };
+    }
+
+    function fmtLeftSeconds(left) {
+      if (left <= 0) return '已过期';
+      const mm = Math.floor(left / 60);
+      const ss = left % 60;
+      return `${mm}:${String(ss).padStart(2, '0')}`;
+    }
+
+    function tickQrCountdown() {
+      if (state.role !== 'desktop') return;
+      if (!ui.qrExpire) return;
+      const now = Math.floor(Date.now() / 1000);
+      const left = Math.max(0, state.qrExpiresAt - now);
+      ui.qrExpire.textContent = `有效期剩余 ${fmtLeftSeconds(left)}`;
+      if (left === 0 && !state.qrRefreshInFlight) {
+        refreshQrPayload();
+      }
+    }
+
+    function startQrCountdown() {
+      if (state.qrCountdownTimer) clearInterval(state.qrCountdownTimer);
+      tickQrCountdown();
+      state.qrCountdownTimer = setInterval(tickQrCountdown, 1000);
+    }
+
+    function applyQrPayload(payload) {
+      if (!payload || !payload.mobile_url || !payload.mobile_qr_data_url) return;
+      serverConfig.mobileUrl = payload.mobile_url;
+      serverConfig.mobileQrDataUrl = payload.mobile_qr_data_url;
+      state.qrExpiresAt = Number(payload.token_expires_at || 0);
+      ui.qrCard.classList.add('show');
+      ui.qrImage.src = serverConfig.mobileQrDataUrl;
+      ui.qrLink.href = serverConfig.mobileUrl;
+      ui.qrLink.textContent = serverConfig.mobileUrl;
+      tickQrCountdown();
+    }
+
+    async function refreshQrPayload() {
+      if (state.role !== 'desktop' || state.qrRefreshInFlight) return;
+      state.qrRefreshInFlight = true;
+      if (ui.refreshQrBtn) ui.refreshQrBtn.disabled = true;
+      try {
+        const resp = await fetch('/auth/mobile-token');
+        if (!resp.ok) throw new Error(`refresh failed: ${resp.status}`);
+        const payload = await resp.json();
+        applyQrPayload(payload);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        state.qrRefreshInFlight = false;
+        if (ui.refreshQrBtn) ui.refreshQrBtn.disabled = false;
+      }
     }
 
     async function uploadFiles(files, source = state.role) {
@@ -428,6 +524,7 @@
           const resp = await fetch('/upload', {
             method: 'POST',
             body: form,
+            headers: authHeaders(),
           });
           if (!resp.ok) {
             const data = await resp.json().catch(() => ({}));
@@ -443,7 +540,9 @@
 
     function wsUrl() {
       const p = location.protocol === 'https:' ? 'wss' : 'ws';
-      return `${p}://${location.host}/ws`;
+      const url = new URL(`${p}://${location.host}/ws`);
+      if (state.sessionId) url.searchParams.set('session_id', state.sessionId);
+      return url.toString();
     }
 
     function resetHeartbeat() {
@@ -513,7 +612,7 @@
 
     async function initHistory() {
       try {
-        const resp = await fetch('/records');
+        const resp = await fetch('/records', { headers: authHeaders() });
         if (!resp.ok) return;
         const data = await resp.json();
         if (!Array.isArray(data.records)) return;
@@ -544,10 +643,16 @@
 
       if (state.role === 'desktop') {
         if (serverConfig.mobileQrDataUrl && serverConfig.mobileUrl) {
-          ui.qrCard.classList.add('show');
-          ui.qrImage.src = serverConfig.mobileQrDataUrl;
-          ui.qrLink.href = serverConfig.mobileUrl;
-          ui.qrLink.textContent = serverConfig.mobileUrl;
+          applyQrPayload({
+            mobile_url: serverConfig.mobileUrl,
+            mobile_qr_data_url: serverConfig.mobileQrDataUrl,
+            token_expires_at: serverConfig.tokenExpiresAt,
+          });
+          startQrCountdown();
+        }
+
+        if (ui.refreshQrBtn) {
+          ui.refreshQrBtn.addEventListener('click', () => refreshQrPayload());
         }
 
         ui.dropZone.style.display = 'block';
@@ -576,6 +681,13 @@
 
     function init() {
       ui.meta.textContent = `${location.origin} · 当前设备: ${state.role === 'desktop' ? '电脑端' : '手机端'}`;
+      if (serverConfig.accessDenied) {
+        setStatus('未授权访问', false, true);
+        ui.tip.textContent = serverConfig.accessDeniedReason || '当前访问未授权，请重新扫码。';
+        ui.sendBtn.disabled = true;
+        ui.sendBtn.style.opacity = '0.5';
+        return;
+      }
       bindEvents();
       initHistory();
       connectWS();
