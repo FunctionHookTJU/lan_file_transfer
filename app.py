@@ -106,6 +106,8 @@ def create_app(
     lan_ip: str,
     initial_mobile_token: str,
     token_ttl_seconds: int = 120,
+    session_ttl_seconds: int = 8 * 60 * 60,
+    max_upload_bytes: int = 10 * 1024 * 1024 * 1024,
     template_dir: Optional[Path] = None,
 ) -> Flask:
     app = Flask(__name__, template_folder=str(template_dir or runtime_template_dir()))
@@ -113,6 +115,8 @@ def create_app(
     app.config["JSON_AS_ASCII"] = False
     app.config["BASE_URL"] = base_url
     app.config["TOKEN_TTL_SECONDS"] = token_ttl_seconds
+    app.config["SESSION_TTL_SECONDS"] = session_ttl_seconds
+    app.config["MAX_UPLOAD_BYTES"] = max_upload_bytes
 
     sock = Sock(app)
     records = []
@@ -126,6 +130,12 @@ def create_app(
         "consumed": False,
     }
     sessions = {}
+
+    def cleanup_expired_sessions_locked(now: int) -> None:
+        ttl = app.config["SESSION_TTL_SECONDS"]
+        expired_ids = [sid for sid, s in sessions.items() if now - s["last_seen_at"] > ttl]
+        for sid in expired_ids:
+            sessions.pop(sid, None)
 
     def random_token(length: int = 12) -> str:
         alphabet = string.ascii_letters + string.digits
@@ -170,7 +180,12 @@ def create_app(
             "download_url": f"/files/{record['id']}",
         }
 
-    def stream_to_disk(file_stream, destination: Path, chunk_size: int = 1024 * 1024) -> int:
+    def stream_to_disk(
+        file_stream,
+        destination: Path,
+        chunk_size: int = 1024 * 1024,
+        max_bytes: Optional[int] = None,
+    ) -> int:
         total = 0
         with destination.open("wb") as f:
             while True:
@@ -179,6 +194,8 @@ def create_app(
                     break
                 f.write(chunk)
                 total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise ValueError("上传文件超过大小限制")
         return total
 
     def broadcast(event: dict) -> None:
@@ -199,24 +216,31 @@ def create_app(
     def is_trusted_desktop(ip: Optional[str]) -> bool:
         return bool(ip and ip in trusted_desktop_ips)
 
-    def read_session_id() -> Optional[str]:
-        return (
-            request.headers.get("X-Session-Id")
-            or request.args.get("session_id")
-            or request.cookies.get("lft_session")
-        )
+    def read_session_id(allow_query: bool = False) -> Optional[str]:
+        if allow_query:
+            return (
+                request.headers.get("X-Session-Id")
+                or request.args.get("session_id")
+                or request.cookies.get("lft_session")
+            )
+        return request.headers.get("X-Session-Id") or request.cookies.get("lft_session")
 
     def get_valid_session(session_id: Optional[str], ip: Optional[str]) -> Optional[dict]:
         if not session_id:
             return None
 
         with lock:
+            now = int(time.time())
+            cleanup_expired_sessions_locked(now)
             session = sessions.get(session_id)
             if session is None:
                 return None
             if session["ip"] != ip:
                 return None
-            session["last_seen_at"] = int(time.time())
+            if now - session["last_seen_at"] > app.config["SESSION_TTL_SECONDS"]:
+                sessions.pop(session_id, None)
+                return None
+            session["last_seen_at"] = now
             return session
 
     def consume_token_and_issue_session(token: str, ip: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -227,6 +251,7 @@ def create_app(
 
         with lock:
             now = time.time()
+            cleanup_expired_sessions_locked(int(now))
             if token_state["token"] != token:
                 return None, "令牌无效"
             if token_state["consumed"]:
@@ -244,11 +269,11 @@ def create_app(
             }
             return session_id, None
 
-    def authorize_request() -> bool:
+    def authorize_request(allow_query_session: bool = False) -> bool:
         ip = request.remote_addr
         if is_trusted_desktop(ip):
             return True
-        session_id = read_session_id()
+        session_id = read_session_id(allow_query=allow_query_session)
         return get_valid_session(session_id, ip) is not None
 
     @app.get("/")
@@ -291,7 +316,7 @@ def create_app(
                     token_expires_at=0,
                 )
             )
-            response.set_cookie("lft_session", active_session_id, httponly=False, samesite="Lax")
+            response.set_cookie("lft_session", active_session_id, httponly=True, samesite="Lax")
             return response
 
         if role == "mobile":
@@ -359,6 +384,37 @@ def create_app(
             data = [public_record(r) for r in records]
         return jsonify({"records": data})
 
+    @app.get("/settings")
+    def get_settings():
+        if not authorize_request():
+            return jsonify({"error": "未授权访问"}), 401
+        return jsonify(
+            {
+                "max_upload_bytes": app.config["MAX_UPLOAD_BYTES"],
+                "session_ttl_seconds": app.config["SESSION_TTL_SECONDS"],
+            }
+        )
+
+    @app.post("/settings/upload-limit")
+    def update_upload_limit():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可修改上传限制"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        raw_limit = payload.get("max_upload_bytes")
+        try:
+            new_limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return jsonify({"error": "max_upload_bytes 必须是整数"}), 400
+
+        min_limit = 1 * 1024 * 1024
+        max_limit = 100 * 1024 * 1024 * 1024
+        if new_limit < min_limit or new_limit > max_limit:
+            return jsonify({"error": "上传限制需在 1MB 到 100GB 之间"}), 400
+
+        app.config["MAX_UPLOAD_BYTES"] = new_limit
+        return jsonify({"ok": True, "max_upload_bytes": new_limit})
+
     @app.post("/upload")
     def upload_file():
         if not authorize_request():
@@ -376,9 +432,18 @@ def create_app(
         saved_name = f"{int(time.time())}_{transfer_id}_{safe_name}"
         destination = app.config["UPLOAD_DIR"] / saved_name
 
+        max_upload_bytes_local = app.config["MAX_UPLOAD_BYTES"]
+        content_len = request.content_length
+        if content_len is not None and content_len > max_upload_bytes_local + 1024 * 1024:
+            return jsonify({"error": "上传文件超过大小限制"}), 413
+
         try:
-            size = stream_to_disk(uploaded.stream, destination)
+            size = stream_to_disk(uploaded.stream, destination, max_bytes=max_upload_bytes_local)
         except Exception as exc:
+            if destination.exists():
+                destination.unlink(missing_ok=True)
+            if isinstance(exc, ValueError):
+                return jsonify({"error": str(exc)}), 413
             return jsonify({"error": f"保存失败: {exc}"}), 500
 
         record = {
@@ -429,7 +494,7 @@ def create_app(
 
     @sock.route("/ws")
     def ws_handler(ws):
-        if not authorize_request():
+        if not authorize_request(allow_query_session=True):
             ws.close()
             return
 
@@ -461,11 +526,21 @@ def start_server(
     save_dir: Optional[Path] = None,
     auto_open_browser: bool = True,
     print_terminal_qr: bool = True,
+    strict_port: bool = False,
 ) -> None:
     upload_dir = (save_dir or default_save_dir()).resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    selected_port = find_available_port(port)
+    selected_port = port if strict_port else find_available_port(port)
+    if strict_port:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("0.0.0.0", port))
+        except OSError as exc:
+            raise RuntimeError(f"端口 {port} 被占用，无法启动。") from exc
+        finally:
+            probe.close()
+
     if selected_port != port:
         print(f"Port {port} is occupied, switched to {selected_port}")
 

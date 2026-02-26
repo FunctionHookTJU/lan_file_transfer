@@ -229,6 +229,7 @@ def main() -> None:
             save_dir=save_dir,
             auto_open_browser=not args.no_browser,
             print_terminal_qr=not args.no_terminal_qr,
+            strict_port=True,
         )
         return
 

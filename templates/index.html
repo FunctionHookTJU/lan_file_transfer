@@ -74,6 +74,12 @@
     .status.ok { color: #0f766e; }
     .status.err { color: var(--danger); }
 
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
     .qr-card {
       margin: 12px 14px 0;
       border: 1px solid var(--line);
@@ -267,6 +273,40 @@
 
     .toast.show { opacity: 1; }
 
+    .settings {
+      margin: 10px 14px 0;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: #fbfdff;
+      display: none;
+      gap: 8px;
+    }
+
+    .settings.show { display: grid; }
+
+    .setting-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: #33485a;
+    }
+
+    .setting-input {
+      border: 1px solid #b9c5d2;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 12px;
+      min-width: 120px;
+    }
+
+    .setting-note {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
     @keyframes pulse {
       from { box-shadow: 0 0 0 rgba(29, 78, 216, 0.0); }
       to { box-shadow: 0 0 0 4px rgba(29, 78, 216, 0.1); }
@@ -281,7 +321,10 @@
         <div class="title">局域网文件传输</div>
         <div class="meta" id="meta"></div>
       </div>
-      <div class="status" id="status">连接中...</div>
+      <div class="top-actions">
+        <button class="btn" id="settingsBtn" type="button">设置</button>
+        <div class="status" id="status">连接中...</div>
+      </div>
     </div>
 
     <div class="qr-card" id="qrCard">
@@ -301,6 +344,16 @@
     </div>
 
     <div class="drop-zone" id="dropZone">拖拽文件到此区域，立即发送到手机</div>
+
+    <div class="settings" id="settingsPanel">
+      <div class="setting-row" id="limitRow">
+        <span>上传限制</span>
+        <input class="setting-input" id="uploadLimitGb" type="number" min="1" max="100" step="1" />
+        <span>GB</span>
+        <button class="btn" id="saveLimitBtn" type="button">保存限制</button>
+      </div>
+      <div class="setting-note" id="secureNote">默认上传上限 10GB，可按需调整。</div>
+    </div>
 
     <div class="bottom">
       <div class="tip" id="tip"></div>
@@ -332,6 +385,7 @@
       qrExpiresAt: Number(serverConfig.tokenExpiresAt || 0),
       qrRefreshInFlight: false,
       qrCountdownTimer: null,
+      maxUploadBytes: 10 * 1024 * 1024 * 1024,
     };
 
     const ui = {
@@ -349,6 +403,12 @@
       qrLink: document.getElementById('qrLink'),
       qrExpire: document.getElementById('qrExpire'),
       refreshQrBtn: document.getElementById('refreshQrBtn'),
+      settingsBtn: document.getElementById('settingsBtn'),
+      settingsPanel: document.getElementById('settingsPanel'),
+      limitRow: document.getElementById('limitRow'),
+      uploadLimitGb: document.getElementById('uploadLimitGb'),
+      saveLimitBtn: document.getElementById('saveLimitBtn'),
+      secureNote: document.getElementById('secureNote'),
     };
 
     function detectRole() {
@@ -374,6 +434,12 @@
       ui.status.textContent = text;
       ui.status.classList.toggle('ok', ok);
       ui.status.classList.toggle('err', err);
+    }
+
+    function toggleSettingsPanel(forceOpen) {
+      const shouldOpen = typeof forceOpen === 'boolean' ? forceOpen : !ui.settingsPanel.classList.contains('show');
+      ui.settingsPanel.classList.toggle('show', shouldOpen);
+      if (ui.settingsBtn) ui.settingsBtn.textContent = shouldOpen ? '收起设置' : '设置';
     }
 
     function createRecordNode(record) {
@@ -442,24 +508,18 @@
 
     function triggerDownload(record) {
       const link = document.createElement('a');
-      link.href = withSession(record.download_url);
+      link.href = record.download_url;
       link.download = record.name;
       document.body.appendChild(link);
       link.click();
       link.remove();
     }
 
-    function withSession(url) {
-      if (!state.sessionId) return url;
-      const u = new URL(url, location.origin);
-      u.searchParams.set('session_id', state.sessionId);
-      return u.pathname + u.search;
-    }
-
     function authHeaders() {
       if (!state.sessionId) return {};
       return { 'X-Session-Id': state.sessionId };
     }
+
 
     function fmtLeftSeconds(left) {
       if (left <= 0) return '已过期';
@@ -516,8 +576,13 @@
 
     async function uploadFiles(files, source = state.role) {
       for (const file of files) {
+        if (file.size > state.maxUploadBytes) {
+          showToast(`${file.name} 超过上传上限`);
+          continue;
+        }
+
         const form = new FormData();
-        form.append('file', file);
+        form.append('file', file, file.name);
         form.append('source', source);
 
         try {
@@ -626,14 +691,59 @@
       }
     }
 
+    function syncLimitInput() {
+      const gb = Math.max(1, Math.round(state.maxUploadBytes / 1024 / 1024 / 1024));
+      ui.uploadLimitGb.value = String(gb);
+    }
+
+    async function loadSettings() {
+      try {
+        const resp = await fetch('/settings', { headers: authHeaders() });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (typeof data.max_upload_bytes === 'number' && data.max_upload_bytes > 0) {
+          state.maxUploadBytes = data.max_upload_bytes;
+          syncLimitInput();
+        }
+      } catch (_) {
+      }
+    }
+
+    async function saveUploadLimit() {
+      const gb = Number(ui.uploadLimitGb.value || '10');
+      if (!Number.isFinite(gb) || gb < 1 || gb > 100) {
+        showToast('上传限制需在 1 到 100 GB');
+        return;
+      }
+      const maxUploadBytes = Math.floor(gb * 1024 * 1024 * 1024);
+      try {
+        const resp = await fetch('/settings/upload-limit', {
+          method: 'POST',
+          headers: {
+            ...authHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ max_upload_bytes: maxUploadBytes }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `保存失败(${resp.status})`);
+        state.maxUploadBytes = data.max_upload_bytes;
+        syncLimitInput();
+        showToast('上传限制已更新');
+      } catch (err) {
+        console.error(err);
+        showToast('上传限制更新失败');
+      }
+    }
+
     function bindEvents() {
+      ui.settingsBtn.addEventListener('click', () => toggleSettingsPanel());
       ui.sendBtn.addEventListener('click', () => ui.fileInput.click());
       ui.fileInput.addEventListener('change', (e) => {
         const files = Array.from(e.target.files || []);
         if (files.length) uploadFiles(files, state.role);
         e.target.value = '';
       });
-
       document.addEventListener('visibilitychange', async () => {
         resetHeartbeat();
         if (document.hidden && 'Notification' in window && Notification.permission === 'default') {
@@ -642,6 +752,9 @@
       });
 
       if (state.role === 'desktop') {
+        ui.limitRow.style.display = 'flex';
+        ui.saveLimitBtn.addEventListener('click', () => saveUploadLimit());
+
         if (serverConfig.mobileQrDataUrl && serverConfig.mobileUrl) {
           applyQrPayload({
             mobile_url: serverConfig.mobileUrl,
@@ -656,7 +769,7 @@
         }
 
         ui.dropZone.style.display = 'block';
-        ui.tip.textContent = '可点击“发送文件”，也可直接把文件拖到页面上传给手机。';
+        ui.tip.textContent = '可点击“发送文件”，也可直接拖拽；默认上传上限 10GB，可在上方修改。';
 
         const enter = () => ui.dropZone.classList.add('active');
         const leave = () => ui.dropZone.classList.remove('active');
@@ -675,20 +788,27 @@
           if (files.length) uploadFiles(files, 'desktop');
         });
       } else {
-        ui.tip.textContent = '点击“发送文件”上传到电脑；收到电脑推送后可一键下载。';
+        ui.limitRow.style.display = 'none';
+        ui.tip.textContent = '点击“发送文件”上传到电脑。';
       }
     }
 
-    function init() {
+    async function init() {
       ui.meta.textContent = `${location.origin} · 当前设备: ${state.role === 'desktop' ? '电脑端' : '手机端'}`;
+      syncLimitInput();
       if (serverConfig.accessDenied) {
         setStatus('未授权访问', false, true);
         ui.tip.textContent = serverConfig.accessDeniedReason || '当前访问未授权，请重新扫码。';
         ui.sendBtn.disabled = true;
         ui.sendBtn.style.opacity = '0.5';
+        ui.settingsPanel.style.opacity = '0.55';
+        ui.settingsPanel.style.pointerEvents = 'none';
+        toggleSettingsPanel(false);
         return;
       }
+      await loadSettings();
       bindEvents();
+      toggleSettingsPanel(false);
       initHistory();
       connectWS();
     }
