@@ -1,13 +1,34 @@
-.venv/
+# Python cache and bytecode
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+
+# Virtual environment
+.venv/
+venv/
+
+# Tool caches
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+
+# IDE/editor files
 .idea/
 .vscode/
+
+# Runtime/generated local data
 received_files/
+*.log
+
+# Build and packaging artifacts (PyInstaller)
+build/
 dist/
-build/pyinstaller/
-*.spec
+*.manifest
+*.pkg
+
+# Installer output artifacts
+installer/Output/
+installer/build/
+installer/dist/
+*.msi
