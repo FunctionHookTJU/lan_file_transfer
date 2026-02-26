@@ -1,5 +1,6 @@
 param(
-    [string]$IsccPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    [string]$IsccPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+    [string]$Version = "1.0.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,8 +17,9 @@ if (-not (Test-Path $IsccPath)) {
     throw "ISCC not found at: $IsccPath. Please install Inno Setup 6."
 }
 
-& $IsccPath $issFile
+$outputBaseFilename = "LANFileTransfer-v$Version-Setup"
+& $IsccPath "/DMyAppVersion=$Version" "/DMyOutputBaseFilename=$outputBaseFilename" $issFile
 if ($LASTEXITCODE -ne 0) {
     throw "ISCC compile failed with exit code $LASTEXITCODE"
 }
-Write-Host "Installer build finished: dist\LANFileTransfer-Setup.exe"
+Write-Host "Installer build finished: dist\$outputBaseFilename.exe"

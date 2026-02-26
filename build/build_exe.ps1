@@ -1,5 +1,6 @@
 param(
-    [string]$PythonExe = ".venv\Scripts\python.exe"
+    [string]$PythonExe = ".venv\Scripts\python.exe",
+    [switch]$SkipInstallDeps
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,20 +13,27 @@ if (-not (Test-Path $PythonExe)) {
 }
 
 Write-Host "Using Python: $PythonExe"
-& $PythonExe -m pip install -r requirements.txt pyinstaller
+if (-not $SkipInstallDeps) {
+    & $PythonExe -m pip install -r requirements.txt pyinstaller
+}
 
 $distDir = Join-Path $projectRoot "dist"
 $buildDir = Join-Path $projectRoot "build\pyinstaller"
+$specFile = Join-Path $projectRoot "LANFileTransfer.spec"
+
+if (-not (Test-Path $specFile)) {
+    throw "Missing spec file: $specFile"
+}
 
 & $PythonExe -m PyInstaller `
     --noconfirm `
     --clean `
-    --onefile `
-    --windowed `
-    --name "LANFileTransfer" `
     --distpath $distDir `
     --workpath $buildDir `
-    --add-data "templates;templates" `
-    tray_app.py
+    $specFile
+
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller failed with exit code $LASTEXITCODE"
+}
 
 Write-Host "EXE build finished: $distDir\LANFileTransfer.exe"

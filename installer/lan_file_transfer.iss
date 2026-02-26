@@ -1,7 +1,18 @@
-#define MyAppName "LAN File Transfer"
-#define MyAppVersion "1.0.0"
-#define MyAppPublisher "FunctionHookTJU"
-#define MyAppExeName "LANFileTransfer.exe"
+#ifndef MyAppName
+  #define MyAppName "LAN File Transfer"
+#endif
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.0"
+#endif
+#ifndef MyAppPublisher
+  #define MyAppPublisher "FunctionHookTJU"
+#endif
+#ifndef MyAppExeName
+  #define MyAppExeName "LANFileTransfer.exe"
+#endif
+#ifndef MyOutputBaseFilename
+  #define MyOutputBaseFilename "LANFileTransfer-Setup"
+#endif
 
 [Setup]
 AppId={{E6D99EEA-5F2A-4324-9274-5F31C4AC0608}
@@ -11,7 +22,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\{#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\dist
-OutputBaseFilename=LANFileTransfer-Setup
+OutputBaseFilename={#MyOutputBaseFilename}
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern

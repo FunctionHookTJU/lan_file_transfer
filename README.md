@@ -78,6 +78,29 @@ python tray_app.py --port 5000
 2. `build_installer.ps1` 打包安装器
 3. 用户安装后通过快捷方式启动，程序常驻托盘
 
+## 一键构建（推荐）
+
+```powershell
+.\build\build_all.ps1
+```
+
+或双击：
+
+```text
+build\build_all.bat
+```
+
+可指定版本号：
+
+```powershell
+.\build\build_all.ps1 -Version 1.2.0
+```
+
+产物：
+
+- `dist\LANFileTransfer.exe`
+- `dist\LANFileTransfer-v<版本号>-Setup.exe`
+
 ## 大文件内存占用处理
 
 上传接口按块写盘（默认 1MB/chunk），避免整文件驻留内存；下载使用 `send_file(..., conditional=True)`，支持流式/分段请求，减少内存压力。
