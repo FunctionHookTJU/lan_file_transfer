@@ -81,3 +81,9 @@ python tray_app.py --port 5000
 ## 大文件内存占用处理
 
 上传接口按块写盘（默认 1MB/chunk），避免整文件驻留内存；下载使用 `send_file(..., conditional=True)`，支持流式/分段请求，减少内存压力。
+
+## 界面截图
+
+![运行界面截图](assets/screenshots/QQ20260226-174000.png)
+
+![功能展示截图](assets/screenshots/qq_pic_merged_1772098923238.jpg)
