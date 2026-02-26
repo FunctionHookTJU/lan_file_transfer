@@ -32,6 +32,20 @@ def get_lan_ip() -> str:
         sock.close()
 
 
+def find_available_port(start_port: int, host: str = "0.0.0.0", max_tries: int = 100) -> int:
+    port = start_port
+    for _ in range(max_tries):
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            test_sock.bind((host, port))
+            return port
+        except OSError:
+            port += 1
+        finally:
+            test_sock.close()
+    raise RuntimeError(f"未找到可用端口，起始端口: {start_port}，尝试次数: {max_tries}")
+
+
 def print_qr(url: str) -> None:
     qr = QRCode(border=1)
     qr.add_data(url)
@@ -451,8 +465,12 @@ def start_server(
     upload_dir = (save_dir or default_save_dir()).resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
 
+    selected_port = find_available_port(port)
+    if selected_port != port:
+        print(f"Port {port} is occupied, switched to {selected_port}")
+
     lan_ip = get_lan_ip()
-    base_url = f"http://{lan_ip}:{port}"
+    base_url = f"http://{lan_ip}:{selected_port}"
     initial_mobile_token = uuid.uuid4().hex
     mobile_url = f"{base_url}/?token={initial_mobile_token}"
     desktop_url = f"{base_url}/?role=desktop"
@@ -479,7 +497,7 @@ def start_server(
         lan_ip=lan_ip,
         initial_mobile_token=initial_mobile_token,
     )
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(host="0.0.0.0", port=selected_port, threaded=True)
 
 
 def parse_args() -> argparse.Namespace:
