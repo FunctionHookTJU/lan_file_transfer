@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask, jsonify, make_response, render_template, request, send_file
+from flask import Flask, after_this_request, jsonify, make_response, render_template, request, send_file
 from flask_sock import Sock
 from qrcode import QRCode
 from werkzeug.utils import secure_filename
@@ -85,6 +85,14 @@ def default_save_dir() -> Path:
     return Path(__file__).resolve().parent / "received_files"
 
 
+def default_transient_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        local_appdata = os.getenv("LOCALAPPDATA")
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return base / "LANFileTransfer" / "transient_uploads"
+    return Path(__file__).resolve().parent / "transient_uploads"
+
+
 def resolve_save_dir(raw_save_dir: Optional[str]) -> Path:
     if not raw_save_dir:
         return default_save_dir().resolve()
@@ -102,6 +110,7 @@ def resolve_save_dir(raw_save_dir: Optional[str]) -> Path:
 
 def create_app(
     upload_dir: Path,
+    transient_upload_dir: Path,
     base_url: str,
     lan_ip: str,
     initial_mobile_token: str,
@@ -112,6 +121,7 @@ def create_app(
 ) -> Flask:
     app = Flask(__name__, template_folder=str(template_dir or runtime_template_dir()))
     app.config["UPLOAD_DIR"] = upload_dir
+    app.config["TRANSIENT_UPLOAD_DIR"] = transient_upload_dir
     app.config["JSON_AS_ASCII"] = False
     app.config["BASE_URL"] = base_url
     app.config["TOKEN_TTL_SECONDS"] = token_ttl_seconds
@@ -179,6 +189,23 @@ def create_app(
             "created_at": record["created_at"],
             "download_url": f"/files/{record['id']}",
         }
+
+    def remove_record_and_file(transfer_id: str) -> None:
+        removed = None
+        with lock:
+            removed = record_map.pop(transfer_id, None)
+            if removed is None:
+                return
+            records[:] = [r for r in records if r["id"] != transfer_id]
+
+        try:
+            removed_path = removed.get("path")
+            if isinstance(removed_path, Path) and removed_path.exists():
+                removed_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        broadcast({"type": "remove_record", "id": transfer_id})
 
     def stream_to_disk(
         file_stream,
@@ -421,7 +448,7 @@ def create_app(
             return jsonify({"error": "未授权访问"}), 401
 
         uploaded = request.files.get("file")
-        source = request.form.get("source", "mobile")
+        source = "desktop" if is_trusted_desktop(request.remote_addr) else "mobile"
 
         if uploaded is None or uploaded.filename == "":
             return jsonify({"error": "缺少文件"}), 400
@@ -430,7 +457,9 @@ def create_app(
         safe_name = secure_filename(original_name) or f"file-{int(time.time())}"
         transfer_id = uuid.uuid4().hex
         saved_name = f"{int(time.time())}_{transfer_id}_{safe_name}"
-        destination = app.config["UPLOAD_DIR"] / saved_name
+        is_transient = source == "desktop"
+        target_dir = app.config["TRANSIENT_UPLOAD_DIR"] if is_transient else app.config["UPLOAD_DIR"]
+        destination = target_dir / saved_name
 
         max_upload_bytes_local = app.config["MAX_UPLOAD_BYTES"]
         content_len = request.content_length
@@ -453,6 +482,7 @@ def create_app(
             "source": source,
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "path": destination,
+            "transient": is_transient,
         }
 
         with lock:
@@ -475,12 +505,18 @@ def create_app(
         if record is None:
             return jsonify({"error": "文件不存在"}), 404
 
-        return send_file(
+        response = send_file(
             record["path"],
             as_attachment=True,
             download_name=record["name"],
             conditional=True,
         )
+        if record.get("transient"):
+            @after_this_request
+            def cleanup_transient_file(resp):
+                remove_record_and_file(transfer_id)
+                return resp
+        return response
 
     @app.get("/health")
     def health():
@@ -529,7 +565,9 @@ def start_server(
     strict_port: bool = False,
 ) -> None:
     upload_dir = (save_dir or default_save_dir()).resolve()
+    transient_upload_dir = default_transient_dir().resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
+    transient_upload_dir.mkdir(parents=True, exist_ok=True)
 
     selected_port = port if strict_port else find_available_port(port)
     if strict_port:
@@ -568,6 +606,7 @@ def start_server(
 
     app = create_app(
         upload_dir=upload_dir,
+        transient_upload_dir=transient_upload_dir,
         base_url=base_url,
         lan_ip=lan_ip,
         initial_mobile_token=initial_mobile_token,

@@ -499,11 +499,14 @@
       if (state.role === 'mobile' && record.source === 'desktop') {
         showToast(`收到文件：${record.name}`);
         notifyInBackground(record);
-        setTimeout(() => {
-          const ok = window.confirm(`收到电脑文件：${record.name}\n是否立即下载？`);
-          if (ok) triggerDownload(record);
-        }, 10);
       }
+    }
+
+    function removeRecord(recordId) {
+      if (!state.recordIdSet.has(recordId)) return;
+      state.recordIdSet.delete(recordId);
+      state.records = state.records.filter((item) => item.id !== recordId);
+      renderRecords();
     }
 
     function triggerDownload(record) {
@@ -649,6 +652,11 @@
 
         if (data.type === 'new_record' && data.record) {
           addRecord(data.record, true);
+          return;
+        }
+
+        if (data.type === 'remove_record' && data.id) {
+          removeRecord(data.id);
         }
       };
 

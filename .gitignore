@@ -22,7 +22,9 @@ received_files/
 *.log
 
 # Build and packaging artifacts (PyInstaller)
-build/
+build/*
+!build/build_all.ps1
+!build/build_all.bat
 dist/
 *.manifest
 *.pkg
