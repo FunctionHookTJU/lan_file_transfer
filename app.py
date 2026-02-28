@@ -4,8 +4,10 @@ import io
 import json
 import os
 import secrets
+import shutil
 import socket
 import string
+import subprocess
 import sys
 import threading
 import time
@@ -93,6 +95,65 @@ def default_transient_dir() -> Path:
     return Path(__file__).resolve().parent / "transient_uploads"
 
 
+def default_download_dir() -> Path:
+    if sys.platform.startswith("win"):
+        user_profile = os.getenv("USERPROFILE")
+        if user_profile:
+            return (Path(user_profile) / "Downloads").resolve()
+    return (Path.home() / "Downloads").resolve()
+
+
+def settings_file_path() -> Path:
+    local_appdata = os.getenv("LOCALAPPDATA")
+    base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+    settings_dir = (base / "LANFileTransfer").resolve()
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    return settings_dir / "settings.json"
+
+
+def load_runtime_settings() -> dict:
+    path = settings_file_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_runtime_settings(settings: dict) -> None:
+    path = settings_file_path()
+    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def normalize_download_dir(raw_dir: str) -> Optional[Path]:
+    if not raw_dir:
+        return None
+    candidate = Path(raw_dir.strip()).expanduser()
+    if not candidate.is_absolute():
+        return None
+    return candidate.resolve()
+
+
+def sanitize_filename_for_windows(name: str) -> str:
+    invalid = '<>:"/\\|?*'
+    result = "".join("_" if ch in invalid else ch for ch in (name or ""))
+    result = result.strip(" .")
+    return result or "downloaded_file"
+
+
+def allocate_unique_file_path(directory: Path, desired_name: str) -> Path:
+    clean_name = sanitize_filename_for_windows(desired_name)
+    stem = Path(clean_name).stem or "downloaded_file"
+    suffix = Path(clean_name).suffix
+    candidate = directory / clean_name
+    index = 1
+    while candidate.exists():
+        candidate = directory / f"{stem} ({index}){suffix}"
+        index += 1
+    return candidate
+
+
 def resolve_save_dir(raw_save_dir: Optional[str]) -> Path:
     if not raw_save_dir:
         return default_save_dir().resolve()
@@ -117,6 +178,7 @@ def create_app(
     token_ttl_seconds: int = 120,
     session_ttl_seconds: int = 8 * 60 * 60,
     max_upload_bytes: int = 10 * 1024 * 1024 * 1024,
+    download_dir: Optional[Path] = None,
     template_dir: Optional[Path] = None,
 ) -> Flask:
     app = Flask(__name__, template_folder=str(template_dir or runtime_template_dir()))
@@ -127,6 +189,7 @@ def create_app(
     app.config["TOKEN_TTL_SECONDS"] = token_ttl_seconds
     app.config["SESSION_TTL_SECONDS"] = session_ttl_seconds
     app.config["MAX_UPLOAD_BYTES"] = max_upload_bytes
+    app.config["DOWNLOAD_DIR"] = (download_dir or default_download_dir()).resolve()
 
     sock = Sock(app)
     records = []
@@ -206,6 +269,14 @@ def create_app(
             pass
 
         broadcast({"type": "remove_record", "id": transfer_id})
+
+    def persist_runtime_setting(key: str, value) -> None:
+        try:
+            settings = load_runtime_settings()
+            settings[key] = value
+            save_runtime_settings(settings)
+        except Exception:
+            pass
 
     def stream_to_disk(
         file_stream,
@@ -419,6 +490,8 @@ def create_app(
             {
                 "max_upload_bytes": app.config["MAX_UPLOAD_BYTES"],
                 "session_ttl_seconds": app.config["SESSION_TTL_SECONDS"],
+                "download_dir": str(app.config["DOWNLOAD_DIR"]),
+                "default_download_dir": str(default_download_dir()),
             }
         )
 
@@ -440,7 +513,46 @@ def create_app(
             return jsonify({"error": "上传限制需在 1MB 到 100GB 之间"}), 400
 
         app.config["MAX_UPLOAD_BYTES"] = new_limit
+        persist_runtime_setting("max_upload_bytes", new_limit)
         return jsonify({"ok": True, "max_upload_bytes": new_limit})
+
+    @app.post("/settings/download-dir")
+    def update_download_dir():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可修改下载目录"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        raw_dir = str(payload.get("download_dir", "")).strip()
+        normalized = normalize_download_dir(raw_dir)
+        if normalized is None:
+            return jsonify({"error": "下载目录必须是绝对路径"}), 400
+
+        app.config["DOWNLOAD_DIR"] = normalized
+        persist_runtime_setting("download_dir", str(normalized))
+        return jsonify({"ok": True, "download_dir": str(normalized)})
+
+    @app.post("/settings/open-download-dir")
+    def open_download_dir():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可打开下载目录"}), 403
+
+        download_dir_local = Path(app.config["DOWNLOAD_DIR"]).resolve()
+        try:
+            download_dir_local.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return jsonify({"error": f"目录不可用: {exc}"}), 500
+
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(download_dir_local))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(download_dir_local)])
+            else:
+                subprocess.Popen(["xdg-open", str(download_dir_local)])
+        except Exception as exc:
+            return jsonify({"error": f"打开目录失败: {exc}"}), 500
+
+        return jsonify({"ok": True, "download_dir": str(download_dir_local)})
 
     @app.post("/upload")
     def upload_file():
@@ -517,6 +629,41 @@ def create_app(
                 remove_record_and_file(transfer_id)
                 return resp
         return response
+
+    @app.post("/files/<transfer_id>/save")
+    def save_file_to_download_dir(transfer_id: str):
+        if not authorize_request():
+            return jsonify({"error": "未授权访问"}), 401
+
+        with lock:
+            record = record_map.get(transfer_id)
+
+        if record is None:
+            return jsonify({"error": "文件不存在"}), 404
+
+        source_path = record.get("path")
+        if not isinstance(source_path, Path) or not source_path.exists():
+            return jsonify({"error": "源文件不可用"}), 404
+
+        download_dir_local = Path(app.config["DOWNLOAD_DIR"]).resolve()
+        try:
+            download_dir_local.mkdir(parents=True, exist_ok=True)
+            target_path = allocate_unique_file_path(download_dir_local, record["name"])
+            shutil.copy2(source_path, target_path)
+        except Exception as exc:
+            return jsonify({"error": f"保存失败: {exc}"}), 500
+
+        if record.get("transient"):
+            remove_record_and_file(transfer_id)
+
+        return jsonify(
+            {
+                "ok": True,
+                "saved_path": str(target_path),
+                "file_name": target_path.name,
+                "download_dir": str(download_dir_local),
+            }
+        )
 
     @app.get("/health")
     def health():
@@ -604,12 +751,23 @@ def start_server(
 
         threading.Thread(target=open_desktop_page, daemon=True).start()
 
+    runtime_settings = load_runtime_settings()
+    runtime_max_upload = runtime_settings.get("max_upload_bytes")
+    if not isinstance(runtime_max_upload, int) or runtime_max_upload <= 0:
+        runtime_max_upload = 10 * 1024 * 1024 * 1024
+
+    runtime_download_dir = normalize_download_dir(str(runtime_settings.get("download_dir", "")))
+    if runtime_download_dir is None:
+        runtime_download_dir = default_download_dir()
+
     app = create_app(
         upload_dir=upload_dir,
         transient_upload_dir=transient_upload_dir,
         base_url=base_url,
         lan_ip=lan_ip,
         initial_mobile_token=initial_mobile_token,
+        max_upload_bytes=runtime_max_upload,
+        download_dir=runtime_download_dir,
     )
     app.run(host="0.0.0.0", port=selected_port, threaded=True)
 

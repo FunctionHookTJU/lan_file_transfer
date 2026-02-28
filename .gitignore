@@ -25,6 +25,8 @@ received_files/
 build/*
 !build/build_all.ps1
 !build/build_all.bat
+!build/build_exe.ps1
+!build/build_exe.bat
 dist/
 *.manifest
 *.pkg

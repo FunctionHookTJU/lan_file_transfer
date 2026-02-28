@@ -352,7 +352,15 @@
         <span>GB</span>
         <button class="btn" id="saveLimitBtn" type="button">保存限制</button>
       </div>
-      <div class="setting-note" id="secureNote">默认上传上限 10GB，可按需调整。</div>
+      <div class="setting-row" id="downloadDirRow">
+        <span>下载目录</span>
+        <input class="setting-input" id="downloadDirInput" type="text" placeholder="例如 C:\Users\YourName\Downloads" style="min-width: 320px;" />
+        <button class="btn" id="pickDownloadDirBtn" type="button">选择文件夹</button>
+        <button class="btn" id="saveDownloadDirBtn" type="button">保存路径</button>
+        <button class="btn" id="openDownloadDirBtn" type="button">打开目录</button>
+        <button class="btn" id="resetDownloadDirBtn" type="button">恢复默认</button>
+      </div>
+      <div class="setting-note" id="secureNote">默认下载目录为 Windows Downloads，上传上限默认 10GB，可按需调整。</div>
     </div>
 
     <div class="bottom">
@@ -386,6 +394,8 @@
       qrRefreshInFlight: false,
       qrCountdownTimer: null,
       maxUploadBytes: 10 * 1024 * 1024 * 1024,
+      downloadDir: '',
+      defaultDownloadDir: '',
     };
 
     const ui = {
@@ -408,6 +418,12 @@
       limitRow: document.getElementById('limitRow'),
       uploadLimitGb: document.getElementById('uploadLimitGb'),
       saveLimitBtn: document.getElementById('saveLimitBtn'),
+      downloadDirRow: document.getElementById('downloadDirRow'),
+      downloadDirInput: document.getElementById('downloadDirInput'),
+      pickDownloadDirBtn: document.getElementById('pickDownloadDirBtn'),
+      saveDownloadDirBtn: document.getElementById('saveDownloadDirBtn'),
+      openDownloadDirBtn: document.getElementById('openDownloadDirBtn'),
+      resetDownloadDirBtn: document.getElementById('resetDownloadDirBtn'),
       secureNote: document.getElementById('secureNote'),
     };
 
@@ -509,13 +525,20 @@
       renderRecords();
     }
 
-    function triggerDownload(record) {
-      const link = document.createElement('a');
-      link.href = record.download_url;
-      link.download = record.name;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
+    async function triggerDownload(record) {
+      try {
+        const resp = await fetch(`/files/${encodeURIComponent(record.id)}/save`, {
+          method: 'POST',
+          headers: authHeaders(),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `保存失败(${resp.status})`);
+        const savedName = data.file_name || record.name;
+        showToast(`已保存：${savedName}`);
+      } catch (err) {
+        console.error(err);
+        showToast('保存失败');
+      }
     }
 
     function authHeaders() {
@@ -713,7 +736,84 @@
           state.maxUploadBytes = data.max_upload_bytes;
           syncLimitInput();
         }
+        if (typeof data.download_dir === 'string' && data.download_dir.trim()) {
+          state.downloadDir = data.download_dir.trim();
+          ui.downloadDirInput.value = state.downloadDir;
+        }
+        if (typeof data.default_download_dir === 'string' && data.default_download_dir.trim()) {
+          state.defaultDownloadDir = data.default_download_dir.trim();
+        }
       } catch (_) {
+      }
+    }
+
+    async function saveDownloadDir() {
+      const downloadDir = (ui.downloadDirInput.value || '').trim();
+      if (!downloadDir) {
+        showToast('请输入下载目录');
+        return;
+      }
+
+      try {
+        const resp = await fetch('/settings/download-dir', {
+          method: 'POST',
+          headers: {
+            ...authHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ download_dir: downloadDir }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `保存失败(${resp.status})`);
+        state.downloadDir = data.download_dir;
+        ui.downloadDirInput.value = state.downloadDir;
+        showToast('下载目录已更新');
+      } catch (err) {
+        console.error(err);
+        showToast('下载目录更新失败');
+      }
+    }
+
+    async function openDownloadDir() {
+      try {
+        const resp = await fetch('/settings/open-download-dir', {
+          method: 'POST',
+          headers: authHeaders(),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `打开失败(${resp.status})`);
+      } catch (err) {
+        console.error(err);
+        showToast('打开目录失败');
+      }
+    }
+
+    function hasDesktopDirectoryPicker() {
+      return !!(window.pywebview && window.pywebview.api && typeof window.pywebview.api.choose_download_directory === 'function');
+    }
+
+    function syncDirectoryPickerAvailability() {
+      if (!ui.pickDownloadDirBtn) return;
+      const ready = hasDesktopDirectoryPicker();
+      ui.pickDownloadDirBtn.disabled = !ready;
+      ui.pickDownloadDirBtn.title = ready ? '' : '仅独立窗口模式可用';
+    }
+
+    async function pickDownloadDir() {
+      if (!hasDesktopDirectoryPicker()) {
+        showToast('当前运行模式不支持系统文件夹选择');
+        return;
+      }
+
+      const current = (ui.downloadDirInput.value || state.downloadDir || state.defaultDownloadDir || '').trim();
+      try {
+        const selected = await window.pywebview.api.choose_download_directory(current);
+        if (!selected) return;
+        ui.downloadDirInput.value = selected;
+        await saveDownloadDir();
+      } catch (err) {
+        console.error(err);
+        showToast('选择目录失败');
       }
     }
 
@@ -745,6 +845,9 @@
     }
 
     function bindEvents() {
+      document.addEventListener('pywebviewready', () => {
+        syncDirectoryPickerAvailability();
+      });
       ui.settingsBtn.addEventListener('click', () => toggleSettingsPanel());
       ui.sendBtn.addEventListener('click', () => ui.fileInput.click());
       ui.fileInput.addEventListener('change', (e) => {
@@ -761,7 +864,20 @@
 
       if (state.role === 'desktop') {
         ui.limitRow.style.display = 'flex';
+        ui.downloadDirRow.style.display = 'flex';
         ui.saveLimitBtn.addEventListener('click', () => saveUploadLimit());
+        ui.pickDownloadDirBtn.addEventListener('click', () => pickDownloadDir());
+        ui.saveDownloadDirBtn.addEventListener('click', () => saveDownloadDir());
+        ui.openDownloadDirBtn.addEventListener('click', () => openDownloadDir());
+        ui.resetDownloadDirBtn.addEventListener('click', () => {
+          if (!state.defaultDownloadDir) {
+            showToast('默认下载目录不可用');
+            return;
+          }
+          ui.downloadDirInput.value = state.defaultDownloadDir;
+          saveDownloadDir();
+        });
+        syncDirectoryPickerAvailability();
 
         if (serverConfig.mobileQrDataUrl && serverConfig.mobileUrl) {
           applyQrPayload({
@@ -777,7 +893,7 @@
         }
 
         ui.dropZone.style.display = 'block';
-        ui.tip.textContent = '可点击“发送文件”，也可直接拖拽；默认上传上限 10GB，可在上方修改。';
+        ui.tip.textContent = '可点击“发送文件”，也可直接拖拽；下载按钮会直接保存到设置中的下载目录。';
 
         const enter = () => ui.dropZone.classList.add('active');
         const leave = () => ui.dropZone.classList.remove('active');
@@ -797,6 +913,7 @@
         });
       } else {
         ui.limitRow.style.display = 'none';
+        ui.downloadDirRow.style.display = 'none';
         ui.tip.textContent = '点击“发送文件”上传到电脑。';
       }
     }
@@ -822,6 +939,7 @@
     }
 
     init();
+    window.__lftOpenSettings = () => toggleSettingsPanel(true);
   </script>
 </body>
 </html>
