@@ -372,15 +372,36 @@
 
   <div class="toast" id="toast"></div>
 
+  <script id="serverConfigData" type="application/json">
+    {{ {
+      "mobileUrl": mobile_url,
+      "mobileQrDataUrl": mobile_qr_data_url,
+      "tokenExpiresAt": token_expires_at,
+      "sessionId": session_id,
+      "accessDenied": access_denied,
+      "accessDeniedReason": access_denied_reason
+    } | tojson }}
+  </script>
+
   <script>
-    const serverConfig = {
-      mobileUrl: {{ mobile_url|tojson }},
-      mobileQrDataUrl: {{ mobile_qr_data_url|tojson }},
-      tokenExpiresAt: {{ token_expires_at|tojson }},
-      sessionId: {{ session_id|tojson }},
-      accessDenied: {{ access_denied|tojson }},
-      accessDeniedReason: {{ access_denied_reason|tojson }},
-    };
+    const serverConfig = (() => {
+      const defaults = {
+        mobileUrl: '',
+        mobileQrDataUrl: '',
+        tokenExpiresAt: 0,
+        sessionId: '',
+        accessDenied: false,
+        accessDeniedReason: '',
+      };
+      const el = document.getElementById('serverConfigData');
+      if (!el) return defaults;
+      try {
+        const parsed = JSON.parse(el.textContent || '{}');
+        return { ...defaults, ...parsed };
+      } catch (_) {
+        return defaults;
+      }
+    })();
 
     const state = {
       role: detectRole(),
@@ -795,8 +816,23 @@
     function syncDirectoryPickerAvailability() {
       if (!ui.pickDownloadDirBtn) return;
       const ready = hasDesktopDirectoryPicker();
-      ui.pickDownloadDirBtn.disabled = !ready;
-      ui.pickDownloadDirBtn.title = ready ? '' : '仅独立窗口模式可用';
+      ui.pickDownloadDirBtn.disabled = false;
+      ui.pickDownloadDirBtn.title = ready ? '' : '当前运行模式不支持系统文件夹选择';
+    }
+
+    function probeDirectoryPickerAvailability(maxAttempts = 20, intervalMs = 300) {
+      if (hasDesktopDirectoryPicker()) {
+        syncDirectoryPickerAvailability();
+        return;
+      }
+      let attempts = 0;
+      const timer = setInterval(() => {
+        attempts += 1;
+        syncDirectoryPickerAvailability();
+        if (hasDesktopDirectoryPicker() || attempts >= maxAttempts) {
+          clearInterval(timer);
+        }
+      }, intervalMs);
     }
 
     async function pickDownloadDir() {
@@ -808,7 +844,10 @@
       const current = (ui.downloadDirInput.value || state.downloadDir || state.defaultDownloadDir || '').trim();
       try {
         const selected = await window.pywebview.api.choose_download_directory(current);
-        if (!selected) return;
+        if (!selected) {
+          showToast('未选择目录');
+          return;
+        }
         ui.downloadDirInput.value = selected;
         await saveDownloadDir();
       } catch (err) {
@@ -845,9 +884,11 @@
     }
 
     function bindEvents() {
-      document.addEventListener('pywebviewready', () => {
+      const onPywebviewReady = () => {
         syncDirectoryPickerAvailability();
-      });
+      };
+      window.addEventListener('pywebviewready', onPywebviewReady);
+      document.addEventListener('pywebviewready', onPywebviewReady);
       ui.settingsBtn.addEventListener('click', () => toggleSettingsPanel());
       ui.sendBtn.addEventListener('click', () => ui.fileInput.click());
       ui.fileInput.addEventListener('change', (e) => {
@@ -878,6 +919,7 @@
           saveDownloadDir();
         });
         syncDirectoryPickerAvailability();
+        probeDirectoryPickerAvailability();
 
         if (serverConfig.mobileQrDataUrl && serverConfig.mobileUrl) {
           applyQrPayload({

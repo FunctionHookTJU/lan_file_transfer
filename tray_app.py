@@ -134,19 +134,20 @@ def build_tray_icon(size: int = 64) -> Image.Image:
 class DesktopBridgeApi:
     def choose_download_directory(self, current_dir: str = "") -> str:
         try:
-            import tkinter as tk
-            from tkinter import filedialog
+            if webview is None or not webview.windows:
+                return ""
 
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            selected = filedialog.askdirectory(
-                title="选择下载目录",
-                initialdir=current_dir or str(backend.default_download_dir()),
-                mustexist=False,
+            window = webview.windows[0]
+            initial_dir = current_dir or str(backend.default_download_dir())
+            result = window.create_file_dialog(
+                webview.FOLDER_DIALOG,
+                directory=initial_dir,
             )
-            root.destroy()
-            return selected or ""
+            if not result:
+                return ""
+            if isinstance(result, (list, tuple)):
+                return str(result[0]) if result[0] else ""
+            return str(result)
         except Exception:
             return ""
 
