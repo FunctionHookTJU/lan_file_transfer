@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask, after_this_request, jsonify, make_response, render_template, request, send_file
+from flask import Flask, jsonify, make_response, render_template, request, send_file
 from flask_sock import Sock
 from qrcode import QRCode
 from werkzeug.utils import secure_filename
@@ -623,11 +623,6 @@ def create_app(
             download_name=record["name"],
             conditional=True,
         )
-        if record.get("transient"):
-            @after_this_request
-            def cleanup_transient_file(resp):
-                remove_record_and_file(transfer_id)
-                return resp
         return response
 
     @app.post("/files/<transfer_id>/save")

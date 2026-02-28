@@ -255,6 +255,101 @@
       animation: pulse 1s ease-in-out infinite alternate;
     }
 
+    .upload-jobs {
+      margin: 0 14px 10px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 8px 10px;
+      background: #f8fbff;
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 180px;
+      overflow-y: auto;
+    }
+
+    .upload-jobs.show { display: flex; }
+
+    .upload-job {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding-right: 24px;
+    }
+
+    .upload-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+    }
+
+    .upload-name {
+      font-weight: 600;
+      color: #22384a;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .upload-status {
+      color: #506578;
+      white-space: nowrap;
+    }
+
+    .upload-meta {
+      font-size: 12px;
+      color: #597087;
+    }
+
+    .progress-track {
+      height: 8px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #d4e1ee;
+    }
+
+    .progress-fill {
+      height: 100%;
+      width: 0;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #22c55e, #16a34a);
+      transition: width 0.16s linear;
+    }
+
+    .upload-job.done .upload-status { color: #15803d; }
+    .upload-job.fail .upload-status { color: var(--danger); }
+    .upload-job.fail .progress-fill { background: var(--danger); }
+    .upload-job.canceled .upload-status { color: var(--danger); }
+    .upload-job.canceled .progress-fill { background: #ef4444; }
+
+    .job-cancel-btn {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 16px;
+      height: 16px;
+      border: 1px solid #ef4444;
+      border-radius: 999px;
+      background: #fff;
+      color: #dc2626;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      line-height: 1;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .job-cancel-btn:hover {
+      background: #fee2e2;
+    }
+
     .toast {
       position: fixed;
       left: 50%;
@@ -345,6 +440,8 @@
 
     <div class="drop-zone" id="dropZone">拖拽文件到此区域，立即发送到手机</div>
 
+    <div class="upload-jobs" id="uploadJobs"></div>
+
     <div class="settings" id="settingsPanel">
       <div class="setting-row" id="limitRow">
         <span>上传限制</span>
@@ -417,6 +514,8 @@
       maxUploadBytes: 10 * 1024 * 1024 * 1024,
       downloadDir: '',
       defaultDownloadDir: '',
+      uploadJobs: [],
+      uploadJobCounter: 0,
     };
 
     const ui = {
@@ -428,6 +527,7 @@
       meta: document.getElementById('meta'),
       tip: document.getElementById('tip'),
       dropZone: document.getElementById('dropZone'),
+      uploadJobs: document.getElementById('uploadJobs'),
       toast: document.getElementById('toast'),
       qrCard: document.getElementById('qrCard'),
       qrImage: document.getElementById('qrImage'),
@@ -548,23 +648,408 @@
 
     async function triggerDownload(record) {
       try {
-        const resp = await fetch(`/files/${encodeURIComponent(record.id)}/save`, {
-          method: 'POST',
-          headers: authHeaders(),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(data.error || `保存失败(${resp.status})`);
+        if (state.role === 'mobile') {
+          await downloadFileInBrowserWithSpeed(record);
+          showToast(`下载完成：${record.name}`);
+          return;
+        }
+
+        const data = await saveFileToDesktopWithSpeed(record);
         const savedName = data.file_name || record.name;
         showToast(`已保存：${savedName}`);
       } catch (err) {
+        if (isCancelError(err)) {
+          showToast('已取消下载');
+          return;
+        }
         console.error(err);
-        showToast('保存失败');
+        showToast('下载失败');
       }
     }
 
     function authHeaders() {
       if (!state.sessionId) return {};
       return { 'X-Session-Id': state.sessionId };
+    }
+
+    function isCancelError(err) {
+      return !!(err && (err.code === 'CANCELED' || err.name === 'AbortError'));
+    }
+
+    function buildCancelError(message) {
+      const error = new Error(message || '操作已取消');
+      error.code = 'CANCELED';
+      return error;
+    }
+
+    function isTransferActive(job) {
+      return !!job && (job.status === 'uploading' || job.status === 'downloading');
+    }
+
+    function createTransferJob({ name, size, kind, cancelable = false }) {
+      const id = `upload-${Date.now()}-${state.uploadJobCounter++}`;
+      state.uploadJobs.push({
+        id,
+        name,
+        size: Math.max(0, Number(size) || 0),
+        kind: kind === 'download' ? 'download' : 'upload',
+        loaded: 0,
+        percent: 0,
+        speedBps: 0,
+        startedAt: Date.now(),
+        lastTickAt: Date.now(),
+        status: kind === 'download' ? 'downloading' : 'uploading',
+        cancelable: !!cancelable,
+        cancelRequested: false,
+        aborter: null,
+      });
+      renderUploadJobs();
+      return id;
+    }
+
+    function getTransferJob(jobId) {
+      return state.uploadJobs.find((item) => item.id === jobId);
+    }
+
+    function updateTransferJob(jobId, patch) {
+      const job = getTransferJob(jobId);
+      if (!job) return;
+      Object.assign(job, patch);
+      if (typeof patch.loaded === 'number' && job.size > 0 && typeof patch.percent !== 'number') {
+        job.percent = Math.min(100, (job.loaded / job.size) * 100);
+      }
+      renderUploadJobs();
+    }
+
+    function cancelTransfer(jobId) {
+      const job = getTransferJob(jobId);
+      if (!job || !job.cancelable || !isTransferActive(job)) return;
+      job.cancelRequested = true;
+      job.cancelable = false;
+      const aborter = job.aborter;
+      job.aborter = null;
+      renderUploadJobs();
+      if (typeof aborter === 'function') {
+        try {
+          aborter();
+        } catch (_) {
+        }
+      }
+    }
+
+    function updateTransferProgress(jobId, loaded, total) {
+      const job = getTransferJob(jobId);
+      if (!job) return;
+      const now = Date.now();
+      const prevLoaded = Math.max(0, Number(job.loaded) || 0);
+      const prevTick = Number(job.lastTickAt) || Number(job.startedAt) || now;
+      const safeLoaded = Math.max(0, Number(loaded) || 0);
+      const safeTotal = Math.max(0, Number(total) || 0) || job.size || safeLoaded;
+      const deltaBytes = Math.max(0, safeLoaded - prevLoaded);
+      const deltaMs = Math.max(1, now - prevTick);
+      const instantBps = (deltaBytes * 1000) / deltaMs;
+      const blendedBps = job.speedBps > 0 ? (job.speedBps * 0.72 + instantBps * 0.28) : instantBps;
+
+      job.loaded = Math.min(safeLoaded, safeTotal);
+      job.percent = safeTotal > 0 ? Math.min(100, (job.loaded / safeTotal) * 100) : 0;
+      job.speedBps = Number.isFinite(blendedBps) ? Math.max(0, blendedBps) : Math.max(0, Number(job.speedBps) || 0);
+      job.lastTickAt = now;
+      renderUploadJobs();
+    }
+
+    function removeTransferJob(jobId) {
+      const next = state.uploadJobs.filter((item) => item.id !== jobId);
+      if (next.length === state.uploadJobs.length) return;
+      state.uploadJobs = next;
+      renderUploadJobs();
+    }
+
+    function scheduleTransferJobRemoval(jobId, delayMs) {
+      setTimeout(() => removeTransferJob(jobId), delayMs);
+    }
+
+    function transferStatusLabel(job) {
+      if (job.status === 'done') return job.kind === 'download' ? '下载完成' : '上传完成';
+      if (job.status === 'fail') return job.kind === 'download' ? '下载失败' : '上传失败';
+      if (job.status === 'canceled') return job.kind === 'download' ? '下载已取消' : '上传已取消';
+      return job.kind === 'download' ? '下载中' : '上传中';
+    }
+
+    function formatPercent(percent) {
+      const safe = Math.max(0, Math.min(100, Number(percent) || 0));
+      return `${Math.round(safe)}%`;
+    }
+
+    function fmtSpeed(bytesPerSecond) {
+      const speed = Number(bytesPerSecond);
+      if (!Number.isFinite(speed) || speed <= 0) return '--';
+      return `${fmtSize(speed)}/s`;
+    }
+
+    function averageSpeedBps(startedAt, bytes) {
+      const started = Number(startedAt) || Date.now();
+      const totalBytes = Math.max(0, Number(bytes) || 0);
+      const elapsedMs = Math.max(1, Date.now() - started);
+      return totalBytes > 0 ? (totalBytes * 1000) / elapsedMs : 0;
+    }
+
+    async function saveFileToDesktopWithSpeed(record) {
+      const totalBytes = Math.max(0, Number(record.size) || 0);
+      const jobId = createTransferJob({
+        name: record.name,
+        size: totalBytes,
+        kind: 'download',
+      });
+      const startedAt = Date.now();
+      try {
+        const resp = await fetch(`/files/${encodeURIComponent(record.id)}/save`, {
+          method: 'POST',
+          headers: authHeaders(),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `保存失败(${resp.status})`);
+
+        updateTransferJob(jobId, {
+          loaded: totalBytes,
+          percent: 100,
+          speedBps: averageSpeedBps(startedAt, totalBytes),
+          status: 'done',
+          lastTickAt: Date.now(),
+        });
+        scheduleTransferJobRemoval(jobId, 3500);
+        return data;
+      } catch (err) {
+        updateTransferJob(jobId, { status: 'fail' });
+        scheduleTransferJobRemoval(jobId, 7000);
+        throw err;
+      }
+    }
+
+    function downloadFileInBrowserWithSpeed(record) {
+      const totalBytes = Math.max(0, Number(record.size) || 0);
+      const jobId = createTransferJob({
+        name: record.name,
+        size: totalBytes,
+        kind: 'download',
+        cancelable: true,
+      });
+      const startedAt = Date.now();
+
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', `/files/${encodeURIComponent(record.id)}`, true);
+        xhr.responseType = 'blob';
+        const headers = authHeaders();
+        for (const [key, value] of Object.entries(headers)) {
+          xhr.setRequestHeader(key, value);
+        }
+        updateTransferJob(jobId, { aborter: () => xhr.abort() });
+
+        xhr.onprogress = (event) => {
+          const progressTotal = event.lengthComputable && event.total > 0 ? event.total : totalBytes;
+          updateTransferProgress(jobId, event.loaded, progressTotal);
+        };
+
+        xhr.onerror = () => {
+          updateTransferJob(jobId, { status: 'fail', cancelable: false, aborter: null });
+          scheduleTransferJobRemoval(jobId, 7000);
+          reject(new Error('网络错误'));
+        };
+
+        xhr.onabort = () => {
+          const job = getTransferJob(jobId);
+          const canceled = !!(job && job.cancelRequested);
+          if (canceled) {
+            updateTransferJob(jobId, { status: 'canceled', speedBps: 0, cancelable: false, aborter: null });
+            scheduleTransferJobRemoval(jobId, 4500);
+            reject(buildCancelError('下载已取消'));
+            return;
+          }
+          updateTransferJob(jobId, { status: 'fail', cancelable: false, aborter: null });
+          scheduleTransferJobRemoval(jobId, 7000);
+          reject(new Error('下载中断'));
+        };
+
+        xhr.onload = () => {
+          if (xhr.status < 200 || xhr.status >= 300) {
+            updateTransferJob(jobId, { status: 'fail', cancelable: false, aborter: null });
+            scheduleTransferJobRemoval(jobId, 7000);
+            reject(new Error(`下载失败(${xhr.status})`));
+            return;
+          }
+
+          const blob = xhr.response instanceof Blob ? xhr.response : new Blob([xhr.response || '']);
+          const loadedBytes = totalBytes > 0 ? totalBytes : (blob.size || 0);
+          const currentJob = getTransferJob(jobId);
+          const smoothSpeed = currentJob ? Number(currentJob.speedBps) || 0 : 0;
+          updateTransferJob(jobId, {
+            loaded: loadedBytes,
+            percent: 100,
+            speedBps: Math.max(smoothSpeed, averageSpeedBps(startedAt, loadedBytes)),
+            status: 'done',
+            cancelable: false,
+            aborter: null,
+            lastTickAt: Date.now(),
+          });
+          scheduleTransferJobRemoval(jobId, 3500);
+
+          const blobUrl = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = blobUrl;
+          link.download = record.name || 'downloaded_file';
+          link.style.display = 'none';
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
+          resolve();
+        };
+
+        xhr.send();
+      });
+    }
+
+    function renderUploadJobs() {
+      ui.uploadJobs.innerHTML = '';
+      if (!state.uploadJobs.length) {
+        ui.uploadJobs.classList.remove('show');
+        return;
+      }
+      ui.uploadJobs.classList.add('show');
+
+      for (const job of state.uploadJobs) {
+        const node = document.createElement('div');
+        node.className = `upload-job ${job.status === 'done' ? 'done' : ''} ${job.status === 'fail' ? 'fail' : ''} ${job.status === 'canceled' ? 'canceled' : ''}`.trim();
+
+        const head = document.createElement('div');
+        head.className = 'upload-head';
+
+        const name = document.createElement('span');
+        name.className = 'upload-name';
+        name.textContent = job.name;
+
+        const status = document.createElement('span');
+        status.className = 'upload-status';
+        status.textContent = transferStatusLabel(job);
+
+        head.appendChild(name);
+        head.appendChild(status);
+        if (job.kind === 'download' && job.cancelable && isTransferActive(job)) {
+          const cancelBtn = document.createElement('button');
+          cancelBtn.type = 'button';
+          cancelBtn.className = 'job-cancel-btn';
+          cancelBtn.textContent = '×';
+          cancelBtn.setAttribute('aria-label', '取消');
+          cancelBtn.addEventListener('click', () => cancelTransfer(job.id));
+          node.appendChild(cancelBtn);
+        }
+
+        const meta = document.createElement('div');
+        meta.className = 'upload-meta';
+        const actionText = job.kind === 'download' ? '下载' : '上传';
+        const speedText = job.status === 'done'
+          ? `平均${actionText}速度 ${fmtSpeed(job.speedBps)}`
+          : `${actionText}速度 ${fmtSpeed(job.speedBps)}`;
+        meta.textContent = `${fmtSize(job.loaded)} / ${fmtSize(job.size)} · ${formatPercent(job.percent)} · ${speedText}`;
+
+        const track = document.createElement('div');
+        track.className = 'progress-track';
+
+        const fill = document.createElement('div');
+        fill.className = 'progress-fill';
+        const isActive = job.status === 'uploading' || job.status === 'downloading';
+        const shownPercent = isActive ? Math.max(2, job.percent) : job.percent;
+        fill.style.width = `${Math.max(0, Math.min(100, shownPercent))}%`;
+
+        track.appendChild(fill);
+        node.appendChild(head);
+        node.appendChild(meta);
+        node.appendChild(track);
+        ui.uploadJobs.appendChild(node);
+      }
+    }
+
+    function sendFileWithProgress(file, source = state.role) {
+      const totalBytes = Math.max(0, Number(file.size) || 0);
+      const jobId = createTransferJob({
+        name: file.name,
+        size: totalBytes,
+        kind: 'upload',
+        cancelable: true,
+      });
+
+      return new Promise((resolve, reject) => {
+        const form = new FormData();
+        form.append('file', file, file.name);
+        form.append('source', source);
+
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/upload', true);
+        const headers = authHeaders();
+        for (const [key, value] of Object.entries(headers)) {
+          xhr.setRequestHeader(key, value);
+        }
+        updateTransferJob(jobId, { aborter: () => xhr.abort() });
+
+        xhr.upload.onprogress = (event) => {
+          const progressTotal = event.lengthComputable && event.total > 0 ? event.total : totalBytes;
+          updateTransferProgress(jobId, event.loaded, progressTotal);
+        };
+
+        xhr.onerror = () => {
+          updateTransferJob(jobId, { status: 'fail', cancelable: false, aborter: null });
+          scheduleTransferJobRemoval(jobId, 6000);
+          reject(new Error('网络错误'));
+        };
+
+        xhr.onabort = () => {
+          const job = getTransferJob(jobId);
+          const canceled = !!(job && job.cancelRequested);
+          if (canceled) {
+            updateTransferJob(jobId, { status: 'canceled', speedBps: 0, cancelable: false, aborter: null });
+            scheduleTransferJobRemoval(jobId, 4500);
+            reject(buildCancelError('上传已取消'));
+            return;
+          }
+          updateTransferJob(jobId, { status: 'fail', cancelable: false, aborter: null });
+          scheduleTransferJobRemoval(jobId, 6000);
+          reject(new Error('上传中断'));
+        };
+
+        xhr.onload = () => {
+          const data = (() => {
+            try {
+              return JSON.parse(xhr.responseText || '{}');
+            } catch (_) {
+              return {};
+            }
+          })();
+
+          if (xhr.status >= 200 && xhr.status < 300) {
+            const currentJob = getTransferJob(jobId);
+            const smoothSpeed = currentJob ? Number(currentJob.speedBps) || 0 : 0;
+            updateTransferJob(jobId, {
+              loaded: totalBytes,
+              percent: 100,
+              speedBps: Math.max(smoothSpeed, averageSpeedBps(currentJob ? currentJob.startedAt : Date.now(), totalBytes)),
+              status: 'done',
+              cancelable: false,
+              aborter: null,
+              lastTickAt: Date.now(),
+            });
+            scheduleTransferJobRemoval(jobId, 3500);
+            resolve(data);
+            return;
+          }
+
+          const message = data.error || `上传失败(${xhr.status})`;
+          updateTransferJob(jobId, { status: 'fail', cancelable: false, aborter: null });
+          scheduleTransferJobRemoval(jobId, 7000);
+          reject(new Error(message));
+        };
+
+        xhr.send(form);
+      });
     }
 
 
@@ -628,22 +1113,14 @@
           continue;
         }
 
-        const form = new FormData();
-        form.append('file', file, file.name);
-        form.append('source', source);
-
         try {
-          const resp = await fetch('/upload', {
-            method: 'POST',
-            body: form,
-            headers: authHeaders(),
-          });
-          if (!resp.ok) {
-            const data = await resp.json().catch(() => ({}));
-            throw new Error(data.error || `上传失败(${resp.status})`);
-          }
+          await sendFileWithProgress(file, source);
           showToast(`${file.name} 上传成功`);
         } catch (err) {
+          if (isCancelError(err)) {
+            showToast(`${file.name} 已取消`);
+            continue;
+          }
           showToast(`${file.name} 上传失败`);
           console.error(err);
         }
