@@ -1,5 +1,6 @@
 param(
     [string]$PythonExe = ".venv\Scripts\python.exe",
+    [string]$Version = "",
     [switch]$SkipInstallDeps
 )
 
@@ -37,3 +38,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "EXE build finished: $distDir\LANFileTransfer.exe"
+
+if ($Version) {
+    $versionedExe = Join-Path $distDir "LANFileTransfer-v$Version.exe"
+    Copy-Item -Path (Join-Path $distDir "LANFileTransfer.exe") -Destination $versionedExe -Force
+    Write-Host "Versioned EXE: $versionedExe"
+}
