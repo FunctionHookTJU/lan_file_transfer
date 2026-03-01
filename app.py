@@ -6,6 +6,7 @@ import os
 import secrets
 import shutil
 import socket
+import sqlite3
 import string
 import subprocess
 import sys
@@ -21,6 +22,9 @@ from flask import Flask, jsonify, make_response, render_template, request, send_
 from flask_sock import Sock
 from qrcode import QRCode
 from werkzeug.utils import secure_filename
+
+APP_NAME = "LANFileTransfer"
+DESKTOP_DEVICE_ID = "desktop"
 
 
 def get_lan_ip() -> str:
@@ -77,6 +81,31 @@ def runtime_template_dir() -> Path:
         if meipass:
             return Path(meipass) / "templates"
     return Path(__file__).resolve().parent / "templates"
+
+
+def persistent_app_data_dir() -> Path:
+    meipass = getattr(sys, "_MEIPASS", None)
+    meipass_path = Path(meipass).resolve() if meipass else None
+    appdata = os.getenv("APPDATA")
+    candidates = []
+    if appdata:
+        candidates.append((Path(appdata) / APP_NAME).resolve())
+    candidates.append(Path(os.path.dirname(sys.executable)).resolve())
+
+    for candidate in candidates:
+        if meipass_path is not None and (candidate == meipass_path or meipass_path in candidate.parents):
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+        return candidate
+
+    raise RuntimeError("无法创建持久化数据目录")
+
+
+def history_db_path() -> Path:
+    return persistent_app_data_dir() / "history.db"
 
 
 def default_save_dir() -> Path:
@@ -180,6 +209,7 @@ def create_app(
     max_upload_bytes: int = 10 * 1024 * 1024 * 1024,
     download_dir: Optional[Path] = None,
     template_dir: Optional[Path] = None,
+    history_db: Optional[Path] = None,
 ) -> Flask:
     app = Flask(__name__, template_folder=str(template_dir or runtime_template_dir()))
     app.config["UPLOAD_DIR"] = upload_dir
@@ -190,13 +220,17 @@ def create_app(
     app.config["SESSION_TTL_SECONDS"] = session_ttl_seconds
     app.config["MAX_UPLOAD_BYTES"] = max_upload_bytes
     app.config["DOWNLOAD_DIR"] = (download_dir or default_download_dir()).resolve()
+    app.config["HISTORY_DB_PATH"] = (history_db or history_db_path()).resolve()
+    app.config["HISTORY_DB_PATH"].parent.mkdir(parents=True, exist_ok=True)
 
     sock = Sock(app)
     records = []
     record_map = {}
-    clients = set()
+    clients = {}
     lock = threading.Lock()
     trusted_desktop_ips = {"127.0.0.1", "::1", lan_ip}
+    mobile_device_names = {}
+    latest_mobile_device_id = {"id": ""}
     token_state = {
         "token": initial_mobile_token,
         "expires_at": time.time() + token_ttl_seconds,
@@ -243,15 +277,168 @@ def create_app(
             "token_expires_at": int(expires_at),
         }
 
-    def public_record(record: dict) -> dict:
+    def history_connection() -> sqlite3.Connection:
+        conn = sqlite3.connect(str(app.config["HISTORY_DB_PATH"]), timeout=15)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def ensure_history_schema() -> None:
+        with history_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transfer_history (
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    device_name TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'mobile'
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transfer_history_device_ts ON transfer_history(device_id, timestamp)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transfer_history_ts ON transfer_history(timestamp)"
+            )
+
+    def normalize_device_id(raw: Optional[str]) -> str:
+        value = str(raw or "").strip()
+        if not value:
+            return ""
+        if len(value) > 120:
+            value = value[:120]
+        safe = "".join(ch for ch in value if ch.isalnum() or ch in ("-", "_"))
+        return safe
+
+    def resolve_request_device(allow_query: bool = False) -> tuple[str, str, bool]:
+        ip = request.remote_addr
+        if is_trusted_desktop(ip):
+            return DESKTOP_DEVICE_ID, "电脑端", True
+
+        raw_device_id = request.headers.get("X-Device-Id")
+        if allow_query and not raw_device_id:
+            raw_device_id = request.args.get("device_id")
+        device_id = normalize_device_id(raw_device_id)
+        if not device_id:
+            raise ValueError("缺少设备标识")
+
+        raw_name = str(request.headers.get("X-Device-Name") or "").strip()
+        device_name = raw_name[:80] if raw_name else f"手机-{device_id[:8]}"
+        with lock:
+            mobile_device_names[device_id] = device_name
+            latest_mobile_device_id["id"] = device_id
+        return device_id, device_name, False
+
+    def preferred_mobile_device_for_desktop() -> tuple[str, str]:
+        with lock:
+            device_id = latest_mobile_device_id["id"]
+            if device_id:
+                return device_id, mobile_device_names.get(device_id, f"手机-{device_id[:8]}")
+        return DESKTOP_DEVICE_ID, "电脑端"
+
+    def insert_history_record(
+        *,
+        history_id: str,
+        device_id: str,
+        device_name: str,
+        file_name: str,
+        file_path: str,
+        direction: str,
+        status: str,
+        file_size: int,
+        source: str,
+        timestamp_text: Optional[str] = None,
+    ) -> None:
+        ts = timestamp_text or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with history_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO transfer_history
+                (id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    history_id,
+                    device_id,
+                    device_name,
+                    file_name,
+                    file_path,
+                    direction,
+                    ts,
+                    status,
+                    max(0, int(file_size or 0)),
+                    source if source in ("desktop", "mobile") else "mobile",
+                ),
+            )
+
+    def update_history_status(history_id: str, status: str) -> None:
+        with history_connection() as conn:
+            conn.execute("UPDATE transfer_history SET status = ? WHERE id = ?", (status, history_id))
+
+    def history_rows(include_all: bool, device_id: Optional[str]) -> list[sqlite3.Row]:
+        with history_connection() as conn:
+            if include_all:
+                cursor = conn.execute(
+                    """
+                    SELECT id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source
+                    FROM transfer_history
+                    ORDER BY timestamp ASC, id ASC
+                    """
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source
+                    FROM transfer_history
+                    WHERE device_id = ?
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    (device_id or "",),
+                )
+            return cursor.fetchall()
+
+    def history_row_by_id(history_id: str) -> Optional[sqlite3.Row]:
+        with history_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source
+                FROM transfer_history
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (history_id,),
+            )
+            return cursor.fetchone()
+
+    def public_history_record(row: sqlite3.Row, include_file_path: bool = False) -> dict:
+        history_id = str(row["id"])
+        with lock:
+            active = record_map.get(history_id)
         return {
-            "id": record["id"],
-            "name": record["name"],
-            "size": record["size"],
-            "source": record["source"],
-            "created_at": record["created_at"],
-            "download_url": f"/files/{record['id']}",
+            "id": history_id,
+            "device_id": str(row["device_id"]),
+            "device_name": str(row["device_name"]),
+            "name": str(row["file_name"]),
+            "file_path": str(row["file_path"]) if include_file_path else "",
+            "direction": str(row["direction"]),
+            "status": str(row["status"]),
+            "size": int(row["file_size"] or 0),
+            "source": str(row["source"] or "mobile"),
+            "created_at": str(row["timestamp"]),
+            "download_url": f"/files/{history_id}" if active is not None else "",
         }
+
+    def send_history_event(history_id: str, target_device_id: str) -> None:
+        row = history_row_by_id(history_id)
+        if row is None:
+            return
+        broadcast({"type": "new_record", "record": public_history_record(row)}, target_device_id=target_device_id)
 
     def remove_record_and_file(transfer_id: str) -> None:
         removed = None
@@ -267,8 +454,6 @@ def create_app(
                 removed_path.unlink(missing_ok=True)
         except Exception:
             pass
-
-        broadcast({"type": "remove_record", "id": transfer_id})
 
     def persist_runtime_setting(key: str, value) -> None:
         try:
@@ -296,12 +481,15 @@ def create_app(
                     raise ValueError("上传文件超过大小限制")
         return total
 
-    def broadcast(event: dict) -> None:
+    def broadcast(event: dict, target_device_id: Optional[str] = None) -> None:
         payload = json.dumps(event, ensure_ascii=False)
         dead = []
         with lock:
-            targets = list(clients)
-        for ws in targets:
+            targets = list(clients.items())
+        for ws, meta in targets:
+            if not meta.get("is_desktop"):
+                if not target_device_id or meta.get("device_id") != target_device_id:
+                    continue
             try:
                 ws.send(payload)
             except Exception:
@@ -309,7 +497,9 @@ def create_app(
         if dead:
             with lock:
                 for ws in dead:
-                    clients.discard(ws)
+                    clients.pop(ws, None)
+
+    ensure_history_schema()
 
     def is_trusted_desktop(ip: Optional[str]) -> bool:
         return bool(ip and ip in trusted_desktop_ips)
@@ -478,8 +668,17 @@ def create_app(
         if not authorize_request():
             return jsonify({"error": "未授权访问"}), 401
 
-        with lock:
-            data = [public_record(r) for r in records]
+        include_all = is_trusted_desktop(request.remote_addr)
+        filter_device_id = None
+        include_file_path = include_all
+        if not include_all:
+            try:
+                filter_device_id, _device_name, _ = resolve_request_device()
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+
+        rows = history_rows(include_all=include_all, device_id=filter_device_id)
+        data = [public_history_record(row, include_file_path=include_file_path) for row in rows]
         return jsonify({"records": data})
 
     @app.get("/settings")
@@ -554,6 +753,137 @@ def create_app(
 
         return jsonify({"ok": True, "download_dir": str(download_dir_local)})
 
+    @app.post("/records/<record_id>/open-folder")
+    def open_record_folder(record_id: str):
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可打开文件目录"}), 403
+
+        row = history_row_by_id(record_id)
+        if row is None:
+            return jsonify({"error": "记录不存在"}), 404
+
+        file_path_raw = str(row["file_path"] or "").strip()
+        if not file_path_raw:
+            return jsonify({"error": "记录缺少文件路径"}), 400
+
+        entry_path = Path(file_path_raw).expanduser()
+        target_dir = entry_path if entry_path.is_dir() else entry_path.parent
+        if not target_dir.exists():
+            return jsonify({"error": "目录不存在"}), 404
+
+        try:
+            if sys.platform.startswith("win"):
+                if entry_path.exists() and entry_path.is_file():
+                    subprocess.Popen(["explorer", "/select,", str(entry_path)])
+                else:
+                    os.startfile(str(target_dir))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(target_dir)])
+        except Exception as exc:
+            return jsonify({"error": f"打开目录失败: {exc}"}), 500
+
+        return jsonify({"ok": True, "folder": str(target_dir)})
+
+    @app.post("/records/<record_id>/open-file")
+    def open_record_file(record_id: str):
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可打开文件"}), 403
+
+        row = history_row_by_id(record_id)
+        if row is None:
+            return jsonify({"error": "记录不存在"}), 404
+
+        file_path_raw = str(row["file_path"] or "").strip()
+        if not file_path_raw:
+            return jsonify({"error": "记录缺少文件路径"}), 400
+
+        entry_path = Path(file_path_raw).expanduser()
+        if not entry_path.exists() or not entry_path.is_file():
+            return jsonify({"error": "文件不存在"}), 404
+
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(entry_path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(entry_path)])
+            else:
+                subprocess.Popen(["xdg-open", str(entry_path)])
+        except Exception as exc:
+            return jsonify({"error": f"打开文件失败: {exc}"}), 500
+
+        return jsonify({"ok": True, "file": str(entry_path)})
+
+    @app.post("/upload-desktop-path")
+    def upload_desktop_path():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可使用本地路径上传"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        raw_file_path = str(payload.get("file_path", "")).strip()
+        if not raw_file_path:
+            return jsonify({"error": "缺少 file_path"}), 400
+
+        source_path = Path(raw_file_path).expanduser()
+        if not source_path.is_absolute():
+            return jsonify({"error": "file_path 必须是绝对路径"}), 400
+        source_path = source_path.resolve()
+        if not source_path.exists() or not source_path.is_file():
+            return jsonify({"error": "源文件不存在"}), 404
+
+        transfer_id = uuid.uuid4().hex
+        device_id, device_name = preferred_mobile_device_for_desktop()
+        created_at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            file_size = int(source_path.stat().st_size)
+        except Exception as exc:
+            return jsonify({"error": f"读取文件信息失败: {exc}"}), 500
+
+        record = {
+            "id": transfer_id,
+            "name": source_path.name,
+            "size": file_size,
+            "source": "desktop",
+            "created_at": created_at_text,
+            "path": source_path,
+            "transient": False,
+            "device_id": device_id,
+            "device_name": device_name,
+            "direction": "上传",
+            "status": "成功",
+        }
+
+        with lock:
+            records.append(record)
+            record_map[transfer_id] = record
+
+        try:
+            insert_history_record(
+                history_id=transfer_id,
+                device_id=device_id,
+                device_name=device_name,
+                file_name=source_path.name,
+                file_path=str(source_path),
+                direction="上传",
+                status="成功",
+                file_size=file_size,
+                source="desktop",
+                timestamp_text=created_at_text,
+            )
+        except Exception as exc:
+            with lock:
+                record_map.pop(transfer_id, None)
+                records[:] = [r for r in records if r["id"] != transfer_id]
+            return jsonify({"error": f"写入历史记录失败: {exc}"}), 500
+
+        send_history_event(transfer_id, target_device_id=device_id)
+        row = history_row_by_id(transfer_id)
+        if row is None:
+            return jsonify({"error": "历史记录不存在"}), 500
+        return jsonify({"ok": True, "record": public_history_record(row, include_file_path=True)})
+
     @app.post("/upload")
     def upload_file():
         if not authorize_request():
@@ -561,17 +891,34 @@ def create_app(
 
         uploaded = request.files.get("file")
         source = "desktop" if is_trusted_desktop(request.remote_addr) else "mobile"
+        if source == "desktop":
+            device_id, device_name = preferred_mobile_device_for_desktop()
+        else:
+            try:
+                device_id, device_name, _ = resolve_request_device()
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
 
         if uploaded is None or uploaded.filename == "":
             return jsonify({"error": "缺少文件"}), 400
 
         original_name = uploaded.filename.strip()
-        safe_name = secure_filename(original_name) or f"file-{int(time.time())}"
         transfer_id = uuid.uuid4().hex
-        saved_name = f"{int(time.time())}_{transfer_id}_{safe_name}"
         is_transient = source == "desktop"
-        target_dir = app.config["TRANSIENT_UPLOAD_DIR"] if is_transient else app.config["UPLOAD_DIR"]
-        destination = target_dir / saved_name
+        if is_transient:
+            safe_name = secure_filename(original_name) or f"file-{int(time.time())}"
+            saved_name = f"{int(time.time())}_{transfer_id}_{safe_name}"
+            target_dir = app.config["TRANSIENT_UPLOAD_DIR"]
+            destination = target_dir / saved_name
+            stored_name = original_name
+        else:
+            target_dir = Path(app.config["DOWNLOAD_DIR"]).resolve()
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                return jsonify({"error": f"保存目录不可用: {exc}"}), 500
+            destination = allocate_unique_file_path(target_dir, original_name)
+            stored_name = destination.name
 
         max_upload_bytes_local = app.config["MAX_UPLOAD_BYTES"]
         content_len = request.content_length
@@ -587,24 +934,47 @@ def create_app(
                 return jsonify({"error": str(exc)}), 413
             return jsonify({"error": f"保存失败: {exc}"}), 500
 
+        created_at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         record = {
             "id": transfer_id,
-            "name": original_name,
+            "name": stored_name,
             "size": size,
             "source": source,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": created_at_text,
             "path": destination,
             "transient": is_transient,
+            "device_id": device_id,
+            "device_name": device_name,
+            "direction": "上传",
+            "status": "成功",
         }
 
         with lock:
             records.append(record)
             record_map[transfer_id] = record
 
-        event = {"type": "new_record", "record": public_record(record)}
-        broadcast(event)
+        try:
+            insert_history_record(
+                history_id=transfer_id,
+                device_id=device_id,
+                device_name=device_name,
+                file_name=stored_name,
+                file_path=str(destination),
+                direction="上传",
+                status="成功",
+                file_size=size,
+                source=source,
+                timestamp_text=created_at_text,
+            )
+        except Exception as exc:
+            remove_record_and_file(transfer_id)
+            return jsonify({"error": f"写入历史记录失败: {exc}"}), 500
 
-        return jsonify({"ok": True, "record": public_record(record)})
+        send_history_event(transfer_id, target_device_id=device_id)
+        row = history_row_by_id(transfer_id)
+        if row is None:
+            return jsonify({"error": "历史记录不存在"}), 500
+        return jsonify({"ok": True, "record": public_history_record(row, include_file_path=is_trusted_desktop(request.remote_addr))})
 
     @app.get("/files/<transfer_id>")
     def download_file(transfer_id: str):
@@ -616,6 +986,33 @@ def create_app(
 
         if record is None:
             return jsonify({"error": "文件不存在"}), 404
+        if not is_trusted_desktop(request.remote_addr):
+            try:
+                req_device_id, req_device_name, _ = resolve_request_device()
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+            if record.get("device_id") != req_device_id:
+                return jsonify({"error": "无权访问该文件"}), 403
+        else:
+            req_device_id = DESKTOP_DEVICE_ID
+            req_device_name = "电脑端"
+
+        try:
+            update_history_status(transfer_id, "已下载")
+            download_history_id = uuid.uuid4().hex
+            insert_history_record(
+                history_id=download_history_id,
+                device_id=req_device_id,
+                device_name=req_device_name,
+                file_name=record["name"],
+                file_path=str(record["path"]),
+                direction="下载",
+                status="成功",
+                file_size=int(record["size"]),
+                source="desktop" if is_trusted_desktop(request.remote_addr) else "mobile",
+            )
+        except Exception as exc:
+            return jsonify({"error": f"写入历史记录失败: {exc}"}), 500
 
         response = send_file(
             record["path"],
@@ -623,6 +1020,7 @@ def create_app(
             download_name=record["name"],
             conditional=True,
         )
+        send_history_event(download_history_id, target_device_id=req_device_id)
         return response
 
     @app.post("/files/<transfer_id>/save")
@@ -639,17 +1037,47 @@ def create_app(
         source_path = record.get("path")
         if not isinstance(source_path, Path) or not source_path.exists():
             return jsonify({"error": "源文件不可用"}), 404
+        if not is_trusted_desktop(request.remote_addr):
+            try:
+                req_device_id, _req_device_name, _ = resolve_request_device()
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+            if record.get("device_id") != req_device_id:
+                return jsonify({"error": "无权保存该文件"}), 403
 
         download_dir_local = Path(app.config["DOWNLOAD_DIR"]).resolve()
         try:
             download_dir_local.mkdir(parents=True, exist_ok=True)
-            target_path = allocate_unique_file_path(download_dir_local, record["name"])
-            shutil.copy2(source_path, target_path)
+            source_resolved = source_path.resolve()
+            if source_resolved.parent == download_dir_local:
+                target_path = source_resolved
+            else:
+                target_path = allocate_unique_file_path(download_dir_local, record["name"])
+                shutil.copy2(source_path, target_path)
         except Exception as exc:
             return jsonify({"error": f"保存失败: {exc}"}), 500
 
+        try:
+            update_history_status(transfer_id, "已保存")
+            saved_history_id = uuid.uuid4().hex
+            insert_history_record(
+                history_id=saved_history_id,
+                device_id=DESKTOP_DEVICE_ID,
+                device_name="电脑端",
+                file_name=target_path.name,
+                file_path=str(target_path),
+                direction="下载",
+                status="成功",
+                file_size=int(record["size"]),
+                source="desktop",
+            )
+        except Exception as exc:
+            return jsonify({"error": f"写入历史记录失败: {exc}"}), 500
+
         if record.get("transient"):
             remove_record_and_file(transfer_id)
+
+        send_history_event(saved_history_id, target_device_id=DESKTOP_DEVICE_ID)
 
         return jsonify(
             {
@@ -676,9 +1104,20 @@ def create_app(
             ws.close()
             return
 
+        is_desktop_client = is_trusted_desktop(request.remote_addr)
+        device_id = DESKTOP_DEVICE_ID
+        if not is_desktop_client:
+            try:
+                device_id, _device_name, _ = resolve_request_device(allow_query=True)
+            except ValueError:
+                ws.close()
+                return
+
+        init_rows = history_rows(include_all=is_desktop_client, device_id=None if is_desktop_client else device_id)
+        init_records = [public_history_record(row, include_file_path=is_desktop_client) for row in init_rows]
+
         with lock:
-            clients.add(ws)
-            init_records = [public_record(r) for r in records]
+            clients[ws] = {"is_desktop": is_desktop_client, "device_id": device_id}
         ws.send(json.dumps({"type": "init", "records": init_records}, ensure_ascii=False))
 
         try:
@@ -694,7 +1133,7 @@ def create_app(
                     ws.send(json.dumps({"type": "pong", "ts": int(time.time() * 1000)}))
         finally:
             with lock:
-                clients.discard(ws)
+                clients.pop(ws, None)
 
     return app
 

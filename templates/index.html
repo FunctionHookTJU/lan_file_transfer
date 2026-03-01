@@ -180,6 +180,11 @@
       font-weight: 600;
       word-break: break-all;
     }
+    .name.clickable {
+      cursor: pointer;
+      text-decoration: underline;
+      text-decoration-color: #94a3b8;
+    }
 
     .desc {
       margin-top: 4px;
@@ -500,8 +505,9 @@
       }
     })();
 
+    const initialRole = detectRole();
     const state = {
-      role: detectRole(),
+      role: initialRole,
       ws: null,
       hbTimer: null,
       reconnectTimer: null,
@@ -516,6 +522,8 @@
       defaultDownloadDir: '',
       uploadJobs: [],
       uploadJobCounter: 0,
+      deviceId: initialRole === 'mobile' ? getOrCreateMobileDeviceId() : 'desktop',
+      deviceName: initialRole === 'mobile' ? detectMobileDeviceName() : '电脑端',
     };
 
     const ui = {
@@ -554,6 +562,48 @@
       return /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent) ? 'mobile' : 'desktop';
     }
 
+    function makeFallbackUuid() {
+      const seed = `${Date.now()}-${Math.random()}-${Math.random()}`;
+      let hex = '';
+      for (let i = 0; i < seed.length; i += 1) {
+        hex += seed.charCodeAt(i).toString(16);
+      }
+      const padded = (hex + '00000000000000000000000000000000').slice(0, 32);
+      return `${padded.slice(0, 8)}-${padded.slice(8, 12)}-${padded.slice(12, 16)}-${padded.slice(16, 20)}-${padded.slice(20, 32)}`;
+    }
+
+    function getOrCreateMobileDeviceId() {
+      const key = 'lft_mobile_device_id';
+      try {
+        const existing = (localStorage.getItem(key) || '').trim();
+        if (existing) return existing;
+      } catch (_) {
+      }
+      const nextId = (window.crypto && typeof window.crypto.randomUUID === 'function')
+        ? window.crypto.randomUUID()
+        : makeFallbackUuid();
+      try {
+        localStorage.setItem(key, nextId);
+      } catch (_) {
+      }
+      return nextId;
+    }
+
+    function detectMobileDeviceName() {
+      const ua = navigator.userAgent || '';
+      if (/iPhone/i.test(ua)) return 'iPhone';
+      if (/iPad/i.test(ua)) return 'iPad';
+      if (/Android/i.test(ua)) return 'Android';
+      return '手机浏览器';
+    }
+
+    function fileNameFromPath(rawPath) {
+      const text = String(rawPath || '').trim();
+      if (!text) return 'file';
+      const parts = text.split(/[/\\]/).filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : text;
+    }
+
     function fmtSize(bytes) {
       if (bytes < 1024) return `${bytes} B`;
       if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -589,24 +639,39 @@
       const name = document.createElement('div');
       name.className = 'name';
       name.textContent = record.name;
+      if (state.role === 'desktop') {
+        name.classList.add('clickable');
+        name.title = '左键打开文件';
+        name.addEventListener('click', () => openRecordFile(record));
+      }
 
       const desc = document.createElement('div');
       desc.className = 'desc';
-      desc.textContent = `${record.source === 'desktop' ? '电脑' : '手机'} · ${fmtSize(record.size)} · ${record.created_at}`;
+      const actionLabel = record.direction || '上传';
+      const deviceLabel = record.device_name || (record.source === 'desktop' ? '电脑端' : '手机端');
+      const statusLabel = record.status ? ` · ${record.status}` : '';
+      desc.textContent = `${actionLabel} · ${deviceLabel} · ${fmtSize(Math.max(0, Number(record.size) || 0))} · ${record.created_at}${statusLabel}`;
 
       const actions = document.createElement('div');
       actions.className = 'actions';
 
-      const dlBtn = document.createElement('button');
-      dlBtn.className = 'btn';
-      dlBtn.textContent = '下载';
-      dlBtn.addEventListener('click', () => triggerDownload(record));
-
-      actions.appendChild(dlBtn);
+      if (record.download_url) {
+        const dlBtn = document.createElement('button');
+        dlBtn.className = 'btn';
+        dlBtn.textContent = '下载';
+        dlBtn.addEventListener('click', () => triggerDownload(record));
+        actions.appendChild(dlBtn);
+      }
       bubble.appendChild(name);
       bubble.appendChild(desc);
       bubble.appendChild(actions);
       row.appendChild(bubble);
+      if (state.role === 'desktop') {
+        row.addEventListener('contextmenu', (event) => {
+          event.preventDefault();
+          openRecordFolder(record);
+        });
+      }
       return row;
     }
 
@@ -667,9 +732,44 @@
       }
     }
 
+    async function openRecordFolder(record) {
+      if (state.role !== 'desktop') return;
+      try {
+        const resp = await fetch(`/records/${encodeURIComponent(record.id)}/open-folder`, {
+          method: 'POST',
+          headers: authHeaders(),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `打开失败(${resp.status})`);
+      } catch (err) {
+        console.error(err);
+        showToast('打开文件夹失败');
+      }
+    }
+
+    async function openRecordFile(record) {
+      if (state.role !== 'desktop') return;
+      try {
+        const resp = await fetch(`/records/${encodeURIComponent(record.id)}/open-file`, {
+          method: 'POST',
+          headers: authHeaders(),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `打开失败(${resp.status})`);
+      } catch (err) {
+        console.error(err);
+        showToast('打开文件失败');
+      }
+    }
+
     function authHeaders() {
-      if (!state.sessionId) return {};
-      return { 'X-Session-Id': state.sessionId };
+      const headers = {};
+      if (state.sessionId) headers['X-Session-Id'] = state.sessionId;
+      if (state.role === 'mobile' && state.deviceId) {
+        headers['X-Device-Id'] = state.deviceId;
+        if (state.deviceName) headers['X-Device-Name'] = state.deviceName;
+      }
+      return headers;
     }
 
     function isCancelError(err) {
@@ -1085,7 +1185,7 @@
       ui.qrCard.classList.add('show');
       ui.qrImage.src = serverConfig.mobileQrDataUrl;
       ui.qrLink.href = serverConfig.mobileUrl;
-      ui.qrLink.textContent = serverConfig.mobileUrl;
+      ui.qrLink.textContent = '打开手机上传页';
       tickQrCountdown();
     }
 
@@ -1127,10 +1227,86 @@
       }
     }
 
+    function hasDesktopUploadPicker() {
+      return !!(window.pywebview && window.pywebview.api && typeof window.pywebview.api.choose_upload_files === 'function');
+    }
+
+    async function uploadDesktopPathNoCopy(filePath) {
+      const displayName = fileNameFromPath(filePath);
+      const jobId = createTransferJob({
+        name: displayName,
+        size: 0,
+        kind: 'upload',
+      });
+      const startedAt = Date.now();
+      try {
+        const resp = await fetch('/upload-desktop-path', {
+          method: 'POST',
+          headers: {
+            ...authHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ file_path: filePath }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `上传失败(${resp.status})`);
+        const finalSize = Math.max(0, Number(data?.record?.size) || 0);
+        updateTransferJob(jobId, {
+          size: finalSize,
+          loaded: finalSize,
+          percent: 100,
+          speedBps: averageSpeedBps(startedAt, finalSize),
+          status: 'done',
+          cancelable: false,
+          aborter: null,
+          lastTickAt: Date.now(),
+        });
+        scheduleTransferJobRemoval(jobId, 3500);
+        return data;
+      } catch (err) {
+        updateTransferJob(jobId, { status: 'fail', cancelable: false, aborter: null });
+        scheduleTransferJobRemoval(jobId, 7000);
+        throw err;
+      }
+    }
+
+    async function uploadDesktopPathsNoCopy(paths) {
+      const normalized = (Array.isArray(paths) ? paths : [])
+        .map((p) => String(p || '').trim())
+        .filter((p) => p.length > 0);
+      for (const filePath of normalized) {
+        try {
+          await uploadDesktopPathNoCopy(filePath);
+          showToast(`${fileNameFromPath(filePath)} 上传成功`);
+        } catch (err) {
+          console.error(err);
+          showToast(`${fileNameFromPath(filePath)} 上传失败`);
+        }
+      }
+    }
+
+    async function pickDesktopFilesNoCopy() {
+      if (!hasDesktopUploadPicker()) {
+        ui.fileInput.click();
+        return;
+      }
+      const current = (ui.downloadDirInput.value || state.downloadDir || state.defaultDownloadDir || '').trim();
+      try {
+        const selected = await window.pywebview.api.choose_upload_files(current);
+        const picked = Array.isArray(selected) ? selected : (selected ? [selected] : []);
+        if (!picked.length) return;
+        await uploadDesktopPathsNoCopy(picked);
+      } catch (err) {
+        console.error(err);
+        showToast('选择文件失败');
+      }
+    }
+
     function wsUrl() {
       const p = location.protocol === 'https:' ? 'wss' : 'ws';
       const url = new URL(`${p}://${location.host}/ws`);
       if (state.sessionId) url.searchParams.set('session_id', state.sessionId);
+      if (state.role === 'mobile' && state.deviceId) url.searchParams.set('device_id', state.deviceId);
       return url.toString();
     }
 
@@ -1367,7 +1543,13 @@
       window.addEventListener('pywebviewready', onPywebviewReady);
       document.addEventListener('pywebviewready', onPywebviewReady);
       ui.settingsBtn.addEventListener('click', () => toggleSettingsPanel());
-      ui.sendBtn.addEventListener('click', () => ui.fileInput.click());
+      ui.sendBtn.addEventListener('click', () => {
+        if (state.role === 'desktop') {
+          pickDesktopFilesNoCopy();
+          return;
+        }
+        ui.fileInput.click();
+      });
       ui.fileInput.addEventListener('change', (e) => {
         const files = Array.from(e.target.files || []);
         if (files.length) uploadFiles(files, state.role);
@@ -1412,7 +1594,7 @@
         }
 
         ui.dropZone.style.display = 'block';
-        ui.tip.textContent = '可点击“发送文件”，也可直接拖拽；下载按钮会直接保存到设置中的下载目录。';
+        ui.tip.textContent = '可点击“发送文件”（桌面模式将直接引用原文件，不再复制）；也可拖拽上传；右键记录可打开文件夹。';
 
         const enter = () => ui.dropZone.classList.add('active');
         const leave = () => ui.dropZone.classList.remove('active');
@@ -1428,7 +1610,15 @@
           e.preventDefault();
           leave();
           const files = Array.from(e.dataTransfer?.files || []);
-          if (files.length) uploadFiles(files, 'desktop');
+          if (!files.length) return;
+          const rawPaths = files
+            .map((file) => String(file && file.path ? file.path : '').trim())
+            .filter((p) => p.length > 0);
+          if (rawPaths.length === files.length) {
+            uploadDesktopPathsNoCopy(rawPaths);
+            return;
+          }
+          uploadFiles(files, 'desktop');
         });
       } else {
         ui.limitRow.style.display = 'none';

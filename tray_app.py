@@ -151,6 +151,26 @@ class DesktopBridgeApi:
         except Exception:
             return ""
 
+    def choose_upload_files(self, current_dir: str = "") -> list[str]:
+        try:
+            if webview is None or not webview.windows:
+                return []
+
+            window = webview.windows[0]
+            initial_dir = current_dir or str(backend.default_download_dir())
+            result = window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                directory=initial_dir,
+                allow_multiple=True,
+            )
+            if not result:
+                return []
+            if isinstance(result, (list, tuple)):
+                return [str(item) for item in result if item]
+            return [str(result)]
+        except Exception:
+            return []
+
 
 class TrayController:
     def __init__(self, port: int, save_dir: Path):
