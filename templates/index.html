@@ -214,6 +214,12 @@
       background: #1d4ed8;
     }
 
+    .btn.danger {
+      border-color: #be123c;
+      color: #be123c;
+      background: #fff1f2;
+    }
+
     .btn.send {
       border-color: var(--accent);
       background: var(--accent);
@@ -373,17 +379,41 @@
 
     .toast.show { opacity: 1; }
 
-    .settings {
-      margin: 10px 14px 0;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 10px;
-      background: #fbfdff;
+    .settings-modal {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.46);
+      z-index: 120;
       display: none;
-      gap: 8px;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
     }
 
-    .settings.show { display: grid; }
+    .settings-modal.show { display: flex; }
+
+    .settings {
+      width: min(960px, 94vw);
+      max-height: 90vh;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: #fbfdff;
+      display: grid;
+      gap: 10px;
+      box-shadow: 0 16px 48px rgba(15, 23, 42, 0.2);
+    }
+
+    .settings-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #1d3550;
+    }
 
     .setting-row {
       display: flex;
@@ -405,6 +435,42 @@
     .setting-note {
       color: var(--muted);
       font-size: 12px;
+    }
+
+    .peer-list {
+      display: grid;
+      gap: 6px;
+      width: min(100%, 760px);
+    }
+
+    .peer-item {
+      border: 1px solid #d6e0ea;
+      border-radius: 10px;
+      background: #fff;
+      padding: 8px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .peer-main {
+      min-width: 0;
+      display: grid;
+      gap: 2px;
+    }
+
+    .peer-name {
+      font-size: 12px;
+      font-weight: 600;
+      color: #203547;
+      word-break: break-all;
+    }
+
+    .peer-meta {
+      font-size: 11px;
+      color: #617487;
+      word-break: break-all;
     }
 
     @keyframes pulse {
@@ -447,7 +513,19 @@
 
     <div class="upload-jobs" id="uploadJobs"></div>
 
+    <div class="bottom">
+      <div class="tip" id="tip"></div>
+      <button class="btn send" id="sendBtn">发送文件</button>
+      <input id="fileInput" type="file" multiple />
+    </div>
+  </div>
+
+  <div class="settings-modal" id="settingsModal">
     <div class="settings" id="settingsPanel">
+      <div class="settings-header">
+        <span>设置</span>
+        <button class="btn" id="closeSettingsBtn" type="button">关闭</button>
+      </div>
       <div class="setting-row" id="limitRow">
         <span>上传限制</span>
         <input class="setting-input" id="uploadLimitGb" type="number" min="1" max="100" step="1" />
@@ -462,13 +540,24 @@
         <button class="btn" id="openDownloadDirBtn" type="button">打开目录</button>
         <button class="btn" id="resetDownloadDirBtn" type="button">恢复默认</button>
       </div>
-      <div class="setting-note" id="secureNote">默认下载目录为 Windows Downloads，上传上限默认 10GB，可按需调整。</div>
-    </div>
-
-    <div class="bottom">
-      <div class="tip" id="tip"></div>
-      <button class="btn send" id="sendBtn">发送文件</button>
-      <input id="fileInput" type="file" multiple />
+      <div class="setting-row" id="sendTargetRow">
+        <span>发送目标</span>
+        <select class="setting-input" id="sendTargetSelect" style="min-width: 240px;"></select>
+      </div>
+      <div class="setting-row" id="peerDiscoveryRow">
+        <span>局域网电脑</span>
+        <button class="btn" id="refreshPeersBtn" type="button">刷新列表</button>
+        <div class="peer-list" id="peerDevices"></div>
+      </div>
+      <div class="setting-row" id="pairRequestsRow">
+        <span>待确认配对</span>
+        <div class="peer-list" id="pairRequests"></div>
+      </div>
+      <div class="setting-row" id="pairedDevicesRow">
+        <span>已配对设备</span>
+        <div class="peer-list" id="pairedDevices"></div>
+      </div>
+      <div class="setting-note" id="secureNote">默认下载目录为 Windows Downloads，上传上限默认 10GB；电脑互传可在上方设备列表发起并确认配对。</div>
     </div>
   </div>
 
@@ -524,6 +613,19 @@
       uploadJobCounter: 0,
       deviceId: initialRole === 'mobile' ? getOrCreateMobileDeviceId() : 'desktop',
       deviceName: initialRole === 'mobile' ? detectMobileDeviceName() : '电脑端',
+      discoveredPeers: [],
+      pairedPeers: [],
+      pendingPairRequests: [],
+      peerRefreshInFlight: false,
+      peerPollTimer: null,
+      desktopTargetDeviceId: (() => {
+        try {
+          const saved = String(localStorage.getItem('lft_desktop_target') || '').trim();
+          return saved || 'mobile';
+        } catch (_) {
+          return 'mobile';
+        }
+      })(),
     };
 
     const ui = {
@@ -543,6 +645,8 @@
       qrExpire: document.getElementById('qrExpire'),
       refreshQrBtn: document.getElementById('refreshQrBtn'),
       settingsBtn: document.getElementById('settingsBtn'),
+      settingsModal: document.getElementById('settingsModal'),
+      closeSettingsBtn: document.getElementById('closeSettingsBtn'),
       settingsPanel: document.getElementById('settingsPanel'),
       limitRow: document.getElementById('limitRow'),
       uploadLimitGb: document.getElementById('uploadLimitGb'),
@@ -553,6 +657,15 @@
       saveDownloadDirBtn: document.getElementById('saveDownloadDirBtn'),
       openDownloadDirBtn: document.getElementById('openDownloadDirBtn'),
       resetDownloadDirBtn: document.getElementById('resetDownloadDirBtn'),
+      sendTargetRow: document.getElementById('sendTargetRow'),
+      sendTargetSelect: document.getElementById('sendTargetSelect'),
+      peerDiscoveryRow: document.getElementById('peerDiscoveryRow'),
+      refreshPeersBtn: document.getElementById('refreshPeersBtn'),
+      peerDevices: document.getElementById('peerDevices'),
+      pairRequestsRow: document.getElementById('pairRequestsRow'),
+      pairRequests: document.getElementById('pairRequests'),
+      pairedDevicesRow: document.getElementById('pairedDevicesRow'),
+      pairedDevices: document.getElementById('pairedDevices'),
       secureNote: document.getElementById('secureNote'),
     };
 
@@ -623,10 +736,259 @@
       ui.status.classList.toggle('err', err);
     }
 
+    function persistDesktopTarget(deviceId) {
+      const value = String(deviceId || 'mobile').trim() || 'mobile';
+      state.desktopTargetDeviceId = value;
+      try {
+        localStorage.setItem('lft_desktop_target', value);
+      } catch (_) {
+      }
+    }
+
     function toggleSettingsPanel(forceOpen) {
-      const shouldOpen = typeof forceOpen === 'boolean' ? forceOpen : !ui.settingsPanel.classList.contains('show');
-      ui.settingsPanel.classList.toggle('show', shouldOpen);
-      if (ui.settingsBtn) ui.settingsBtn.textContent = shouldOpen ? '收起设置' : '设置';
+      if (!ui.settingsModal) return;
+      const shouldOpen = typeof forceOpen === 'boolean' ? forceOpen : !ui.settingsModal.classList.contains('show');
+      ui.settingsModal.classList.toggle('show', shouldOpen);
+      if (ui.settingsBtn) ui.settingsBtn.textContent = shouldOpen ? '关闭设置' : '设置';
+    }
+
+    function createPeerItem(title, metaText, actionBuilder) {
+      const item = document.createElement('div');
+      item.className = 'peer-item';
+      const main = document.createElement('div');
+      main.className = 'peer-main';
+      const nameEl = document.createElement('div');
+      nameEl.className = 'peer-name';
+      nameEl.textContent = title;
+      const metaEl = document.createElement('div');
+      metaEl.className = 'peer-meta';
+      metaEl.textContent = metaText;
+      main.appendChild(nameEl);
+      main.appendChild(metaEl);
+      item.appendChild(main);
+      if (typeof actionBuilder === 'function') {
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        actionBuilder(actions);
+        item.appendChild(actions);
+      }
+      return item;
+    }
+
+    function renderDiscoveredPeers() {
+      if (!ui.peerDevices) return;
+      ui.peerDevices.innerHTML = '';
+      const devices = Array.isArray(state.discoveredPeers) ? state.discoveredPeers : [];
+      if (!devices.length) {
+        ui.peerDevices.appendChild(createPeerItem('暂无在线电脑', '请稍候，设备会在局域网自动发现'));
+        return;
+      }
+      for (const peer of devices) {
+        const meta = `${peer.host}:${peer.port}${peer.paired ? ' · 已配对' : ''}`;
+        const row = createPeerItem(peer.device_name || peer.device_id, meta, (actions) => {
+          const btn = document.createElement('button');
+          btn.className = 'btn';
+          btn.type = 'button';
+          btn.textContent = peer.paired ? '重新请求配对' : '请求配对';
+          btn.addEventListener('click', () => sendPairRequest(peer.device_id));
+          actions.appendChild(btn);
+        });
+        ui.peerDevices.appendChild(row);
+      }
+    }
+
+    function renderPendingPairRequests() {
+      if (!ui.pairRequests) return;
+      ui.pairRequests.innerHTML = '';
+      const requests = Array.isArray(state.pendingPairRequests) ? state.pendingPairRequests : [];
+      if (!requests.length) {
+        ui.pairRequests.appendChild(createPeerItem('暂无待处理请求', '对端发起配对后会在这里显示'));
+        return;
+      }
+      for (const req of requests) {
+        const meta = `${req.from_host}:${req.from_port}`;
+        const row = createPeerItem(req.from_device_name || req.from_device_id, meta, (actions) => {
+          const acceptBtn = document.createElement('button');
+          acceptBtn.className = 'btn';
+          acceptBtn.type = 'button';
+          acceptBtn.textContent = '同意';
+          acceptBtn.addEventListener('click', () => respondPairRequest(req.request_id, true));
+          const rejectBtn = document.createElement('button');
+          rejectBtn.className = 'btn';
+          rejectBtn.type = 'button';
+          rejectBtn.textContent = '拒绝';
+          rejectBtn.addEventListener('click', () => respondPairRequest(req.request_id, false));
+          actions.appendChild(acceptBtn);
+          actions.appendChild(rejectBtn);
+        });
+        ui.pairRequests.appendChild(row);
+      }
+    }
+
+    function renderPairedPeers() {
+      if (!ui.pairedDevices) return;
+      ui.pairedDevices.innerHTML = '';
+      const devices = Array.isArray(state.pairedPeers) ? state.pairedPeers : [];
+      if (!devices.length) {
+        ui.pairedDevices.appendChild(createPeerItem('暂无已配对设备', '完成一次对端确认后会持久保存'));
+        return;
+      }
+      for (const peer of devices) {
+        const status = peer.online ? '在线' : '离线';
+        const meta = `${peer.host}:${peer.port} · ${status}`;
+        const row = createPeerItem(peer.device_name || peer.device_id, meta, (actions) => {
+          const removeBtn = document.createElement('button');
+          removeBtn.className = 'btn danger';
+          removeBtn.type = 'button';
+          removeBtn.textContent = '删除配对';
+          removeBtn.addEventListener('click', () => removePairedPeer(peer.device_id, peer.device_name || peer.device_id));
+          actions.appendChild(removeBtn);
+        });
+        ui.pairedDevices.appendChild(row);
+      }
+    }
+
+    function syncDesktopTargetOptions() {
+      if (!ui.sendTargetSelect) return;
+      const previous = String(state.desktopTargetDeviceId || ui.sendTargetSelect.value || 'mobile');
+      const options = [{ value: 'mobile', label: '手机端（默认）' }];
+      for (const peer of (Array.isArray(state.pairedPeers) ? state.pairedPeers : [])) {
+        const suffix = peer.online ? '在线' : '离线';
+        options.push({
+          value: peer.device_id,
+          label: `${peer.device_name || peer.device_id}（${suffix}）`,
+        });
+      }
+      if (previous !== 'mobile' && !options.some((item) => item.value === previous)) {
+        options.push({ value: previous, label: `${previous.slice(0, 8)}（离线）` });
+      }
+      ui.sendTargetSelect.innerHTML = '';
+      for (const option of options) {
+        const el = document.createElement('option');
+        el.value = option.value;
+        el.textContent = option.label;
+        ui.sendTargetSelect.appendChild(el);
+      }
+      const exists = options.some((item) => item.value === previous);
+      if (exists) {
+        persistDesktopTarget(previous);
+      } else if (previous !== 'mobile' && state.pairedPeers.length === 1) {
+        persistDesktopTarget(String(state.pairedPeers[0].device_id || 'mobile'));
+      } else {
+        persistDesktopTarget('mobile');
+      }
+      ui.sendTargetSelect.value = state.desktopTargetDeviceId;
+    }
+
+    function renderPeerState() {
+      syncDesktopTargetOptions();
+      renderDiscoveredPeers();
+      renderPendingPairRequests();
+      renderPairedPeers();
+    }
+
+    async function refreshPeerState(silent = true) {
+      if (state.role !== 'desktop' || state.peerRefreshInFlight) return;
+      state.peerRefreshInFlight = true;
+      if (ui.refreshPeersBtn) ui.refreshPeersBtn.disabled = true;
+      try {
+        const [discoveredResp, pairedResp, pendingResp] = await Promise.all([
+          fetch('/peers/discovered', { headers: authHeaders() }),
+          fetch('/peers/paired', { headers: authHeaders() }),
+          fetch('/pairing/pending', { headers: authHeaders() }),
+        ]);
+        if (discoveredResp.ok) {
+          const discoveredData = await discoveredResp.json();
+          state.discoveredPeers = Array.isArray(discoveredData.devices) ? discoveredData.devices : [];
+        }
+        if (pairedResp.ok) {
+          const pairedData = await pairedResp.json();
+          state.pairedPeers = Array.isArray(pairedData.devices) ? pairedData.devices : [];
+        }
+        if (pendingResp.ok) {
+          const pendingData = await pendingResp.json();
+          state.pendingPairRequests = Array.isArray(pendingData.requests) ? pendingData.requests : [];
+        }
+        renderPeerState();
+      } catch (err) {
+        console.error(err);
+        if (!silent) showToast('设备列表刷新失败');
+      } finally {
+        state.peerRefreshInFlight = false;
+        if (ui.refreshPeersBtn) ui.refreshPeersBtn.disabled = false;
+      }
+    }
+
+    async function sendPairRequest(targetDeviceId) {
+      const deviceId = String(targetDeviceId || '').trim();
+      if (!deviceId) return;
+      try {
+        const resp = await fetch('/peers/pair-request', {
+          method: 'POST',
+          headers: {
+            ...authHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ target_device_id: deviceId }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `请求失败(${resp.status})`);
+        showToast(`已向 ${data.target_device_name || '目标设备'} 发送配对请求`);
+      } catch (err) {
+        console.error(err);
+        showToast('发送配对请求失败');
+      } finally {
+        refreshPeerState(true);
+      }
+    }
+
+    async function respondPairRequest(requestId, accepted) {
+      const id = String(requestId || '').trim();
+      if (!id) return;
+      try {
+        const resp = await fetch('/pairing/respond', {
+          method: 'POST',
+          headers: {
+            ...authHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ request_id: id, accepted: !!accepted }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `处理失败(${resp.status})`);
+        showToast(accepted ? '已同意配对' : '已拒绝配对');
+      } catch (err) {
+        console.error(err);
+        showToast('处理配对请求失败');
+      } finally {
+        refreshPeerState(true);
+      }
+    }
+
+    async function removePairedPeer(deviceId, deviceName) {
+      const id = String(deviceId || '').trim();
+      if (!id) return;
+      if (!window.confirm(`确认删除与“${deviceName || id}”的配对关系吗？`)) return;
+      try {
+        const resp = await fetch(`/peers/paired/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+          headers: authHeaders(),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `删除失败(${resp.status})`);
+        showToast(`已删除 ${deviceName || id} 的配对`);
+      } catch (err) {
+        console.error(err);
+        showToast('删除配对失败');
+      } finally {
+        refreshPeerState(true);
+      }
+    }
+
+    function startPeerPolling() {
+      if (state.peerPollTimer) clearInterval(state.peerPollTimer);
+      refreshPeerState(true);
+      state.peerPollTimer = setInterval(() => refreshPeerState(true), 4000);
     }
 
     function createRecordNode(record) {
@@ -765,6 +1127,9 @@
     function authHeaders() {
       const headers = {};
       if (state.sessionId) headers['X-Session-Id'] = state.sessionId;
+      if (state.role === 'desktop' && state.desktopTargetDeviceId && state.desktopTargetDeviceId !== 'mobile') {
+        headers['X-Target-Device-Id'] = state.desktopTargetDeviceId;
+      }
       if (state.role === 'mobile' && state.deviceId) {
         headers['X-Device-Id'] = state.deviceId;
         if (state.deviceName) headers['X-Device-Name'] = state.deviceName;
@@ -1221,7 +1586,8 @@
             showToast(`${file.name} 已取消`);
             continue;
           }
-          showToast(`${file.name} 上传失败`);
+          const message = (err && err.message) ? err.message : '未知错误';
+          showToast(`${file.name} 上传失败：${message}`);
           console.error(err);
         }
       }
@@ -1280,7 +1646,8 @@
           showToast(`${fileNameFromPath(filePath)} 上传成功`);
         } catch (err) {
           console.error(err);
-          showToast(`${fileNameFromPath(filePath)} 上传失败`);
+          const message = (err && err.message) ? err.message : '未知错误';
+          showToast(`${fileNameFromPath(filePath)} 上传失败：${message}`);
         }
       }
     }
@@ -1349,6 +1716,25 @@
 
         if (data.type === 'new_record' && data.record) {
           addRecord(data.record, true);
+          return;
+        }
+
+        if (data.type === 'pairing_request') {
+          showToast('收到新的配对请求');
+          refreshPeerState(true);
+          return;
+        }
+
+        if (data.type === 'pairing_result') {
+          const peerName = data.device_name || '对端设备';
+          const message = data.accepted ? `${peerName} 配对成功` : `${peerName} 拒绝了配对`;
+          showToast(message);
+          refreshPeerState(true);
+          return;
+        }
+
+        if (data.type === 'pairing_list_updated') {
+          refreshPeerState(true);
           return;
         }
 
@@ -1543,6 +1929,17 @@
       window.addEventListener('pywebviewready', onPywebviewReady);
       document.addEventListener('pywebviewready', onPywebviewReady);
       ui.settingsBtn.addEventListener('click', () => toggleSettingsPanel());
+      if (ui.closeSettingsBtn) {
+        ui.closeSettingsBtn.addEventListener('click', () => toggleSettingsPanel(false));
+      }
+      if (ui.settingsModal) {
+        ui.settingsModal.addEventListener('click', (event) => {
+          if (event.target === ui.settingsModal) toggleSettingsPanel(false);
+        });
+      }
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') toggleSettingsPanel(false);
+      });
       ui.sendBtn.addEventListener('click', () => {
         if (state.role === 'desktop') {
           pickDesktopFilesNoCopy();
@@ -1565,10 +1962,23 @@
       if (state.role === 'desktop') {
         ui.limitRow.style.display = 'flex';
         ui.downloadDirRow.style.display = 'flex';
+        ui.sendTargetRow.style.display = 'flex';
+        ui.peerDiscoveryRow.style.display = 'flex';
+        ui.pairRequestsRow.style.display = 'flex';
+        ui.pairedDevicesRow.style.display = 'flex';
         ui.saveLimitBtn.addEventListener('click', () => saveUploadLimit());
         ui.pickDownloadDirBtn.addEventListener('click', () => pickDownloadDir());
         ui.saveDownloadDirBtn.addEventListener('click', () => saveDownloadDir());
         ui.openDownloadDirBtn.addEventListener('click', () => openDownloadDir());
+        if (ui.refreshPeersBtn) {
+          ui.refreshPeersBtn.addEventListener('click', () => refreshPeerState(false));
+        }
+        if (ui.sendTargetSelect) {
+          ui.sendTargetSelect.addEventListener('change', () => {
+            const value = String(ui.sendTargetSelect.value || 'mobile').trim();
+            persistDesktopTarget(value || 'mobile');
+          });
+        }
         ui.resetDownloadDirBtn.addEventListener('click', () => {
           if (!state.defaultDownloadDir) {
             showToast('默认下载目录不可用');
@@ -1620,9 +2030,14 @@
           }
           uploadFiles(files, 'desktop');
         });
+        startPeerPolling();
       } else {
         ui.limitRow.style.display = 'none';
         ui.downloadDirRow.style.display = 'none';
+        ui.sendTargetRow.style.display = 'none';
+        ui.peerDiscoveryRow.style.display = 'none';
+        ui.pairRequestsRow.style.display = 'none';
+        ui.pairedDevicesRow.style.display = 'none';
         ui.tip.textContent = '点击“发送文件”上传到电脑。';
       }
     }
@@ -1630,11 +2045,13 @@
     async function init() {
       ui.meta.textContent = `${location.origin} · 当前设备: ${state.role === 'desktop' ? '电脑端' : '手机端'}`;
       syncLimitInput();
+      if (state.role === 'desktop') renderPeerState();
       if (serverConfig.accessDenied) {
         setStatus('未授权访问', false, true);
         ui.tip.textContent = serverConfig.accessDeniedReason || '当前访问未授权，请重新扫码。';
         ui.sendBtn.disabled = true;
         ui.sendBtn.style.opacity = '0.5';
+        ui.settingsBtn.disabled = true;
         ui.settingsPanel.style.opacity = '0.55';
         ui.settingsPanel.style.pointerEvents = 'none';
         toggleSettingsPanel(false);

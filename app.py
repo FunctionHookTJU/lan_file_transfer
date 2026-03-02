@@ -12,6 +12,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import webbrowser
 from datetime import datetime
@@ -21,6 +24,7 @@ from typing import Optional
 from flask import Flask, jsonify, make_response, render_template, request, send_file
 from flask_sock import Sock
 from qrcode import QRCode
+import requests
 from werkzeug.utils import secure_filename
 
 APP_NAME = "LANFileTransfer"
@@ -198,11 +202,45 @@ def resolve_save_dir(raw_save_dir: Optional[str]) -> Path:
     return (base_dir / save_dir).resolve()
 
 
+def normalize_device_identifier(raw: Optional[str], max_len: int = 120) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    safe = "".join(ch for ch in value[:max_len] if ch.isalnum() or ch in ("-", "_"))
+    return safe
+
+
+def normalize_device_name(raw: Optional[str], fallback: str = "电脑端", max_len: int = 80) -> str:
+    name = str(raw or "").strip()
+    if not name:
+        return fallback
+    return name[:max_len]
+
+
+def load_or_create_local_device_identity() -> tuple[str, str]:
+    settings = load_runtime_settings()
+    device_id = normalize_device_identifier(settings.get("desktop_device_id"))
+    if not device_id:
+        device_id = uuid.uuid4().hex
+        settings["desktop_device_id"] = device_id
+
+    fallback_name = socket.gethostname() or "电脑端"
+    device_name = normalize_device_name(settings.get("desktop_device_name"), fallback=fallback_name)
+    if settings.get("desktop_device_name") != device_name:
+        settings["desktop_device_name"] = device_name
+
+    save_runtime_settings(settings)
+    return device_id, device_name
+
+
 def create_app(
     upload_dir: Path,
     transient_upload_dir: Path,
     base_url: str,
     lan_ip: str,
+    http_port: int,
+    local_device_id: str,
+    local_device_name: str,
     initial_mobile_token: str,
     token_ttl_seconds: int = 120,
     session_ttl_seconds: int = 8 * 60 * 60,
@@ -229,8 +267,21 @@ def create_app(
     clients = {}
     lock = threading.Lock()
     trusted_desktop_ips = {"127.0.0.1", "::1", lan_ip}
+    peer_discovery_port = 54546
+    peer_announce_interval = 3.0
+    peer_stale_seconds = 15
+    pair_request_ttl_seconds = 120
+    self_device_id = normalize_device_identifier(local_device_id) or uuid.uuid4().hex
+    self_device_name = normalize_device_name(local_device_name, fallback=(socket.gethostname() or "电脑端"))
+    app.config["SELF_DEVICE_ID"] = self_device_id
+    app.config["SELF_DEVICE_NAME"] = self_device_name
+    app.config["HTTP_PORT"] = int(http_port)
     mobile_device_names = {}
     latest_mobile_device_id = {"id": ""}
+    discovered_desktops = {}
+    paired_desktops = {}
+    pending_pair_requests = {}
+    outgoing_pair_requests = {}
     token_state = {
         "token": initial_mobile_token,
         "expires_at": time.time() + token_ttl_seconds,
@@ -308,13 +359,7 @@ def create_app(
             )
 
     def normalize_device_id(raw: Optional[str]) -> str:
-        value = str(raw or "").strip()
-        if not value:
-            return ""
-        if len(value) > 120:
-            value = value[:120]
-        safe = "".join(ch for ch in value if ch.isalnum() or ch in ("-", "_"))
-        return safe
+        return normalize_device_identifier(raw)
 
     def resolve_request_device(allow_query: bool = False) -> tuple[str, str, bool]:
         ip = request.remote_addr
@@ -341,6 +386,506 @@ def create_app(
             if device_id:
                 return device_id, mobile_device_names.get(device_id, f"手机-{device_id[:8]}")
         return DESKTOP_DEVICE_ID, "电脑端"
+
+    def normalize_peer_name(raw: Optional[str], fallback: str) -> str:
+        return normalize_device_name(raw, fallback=fallback)
+
+    def encode_header_text(value: Optional[str], fallback: str) -> str:
+        normalized = normalize_device_name(value, fallback=fallback)
+        try:
+            normalized.encode("latin-1")
+            return normalized
+        except UnicodeEncodeError:
+            return urllib.parse.quote(normalized, safe="")
+
+    def decode_header_text(value: Optional[str]) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        return urllib.parse.unquote(raw)
+
+    def parse_peer_port(raw) -> Optional[int]:
+        try:
+            port = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if 1 <= port <= 65535:
+            return port
+        return None
+
+    def serialize_paired_desktops_locked() -> list[dict]:
+        rows = []
+        for device_id, peer in paired_desktops.items():
+            host = str(peer.get("host") or "").strip()
+            port = parse_peer_port(peer.get("port"))
+            if not host or port is None:
+                continue
+            rows.append(
+                {
+                    "device_id": device_id,
+                    "device_name": normalize_peer_name(peer.get("device_name"), fallback=f"电脑-{device_id[:8]}"),
+                    "host": host,
+                    "port": port,
+                    "paired_at": int(peer.get("paired_at") or int(time.time())),
+                }
+            )
+        rows.sort(key=lambda item: item["device_name"])
+        return rows
+
+    def persist_paired_desktops() -> None:
+        with lock:
+            payload = serialize_paired_desktops_locked()
+        persist_runtime_setting("paired_desktops", payload)
+
+    def refresh_discovered_from_peer_locked(
+        device_id: str, device_name: str, host: str, port: int, seen_at: Optional[float] = None
+    ) -> None:
+        now = float(seen_at if seen_at is not None else time.time())
+        discovered_desktops[device_id] = {
+            "device_id": device_id,
+            "device_name": device_name,
+            "host": host,
+            "port": int(port),
+            "last_seen_at": int(now),
+        }
+        paired = paired_desktops.get(device_id)
+        if paired is not None:
+            paired["device_name"] = device_name
+            paired["host"] = host
+            paired["port"] = int(port)
+            paired["last_seen_at"] = int(now)
+
+    def cleanup_discovered_desktops_locked(now: Optional[float] = None) -> None:
+        ts = float(now if now is not None else time.time())
+        expired = [
+            peer_id
+            for peer_id, peer in discovered_desktops.items()
+            if ts - float(peer.get("last_seen_at", 0)) > peer_stale_seconds
+        ]
+        for peer_id in expired:
+            discovered_desktops.pop(peer_id, None)
+
+    def cleanup_pair_requests_locked(now: Optional[float] = None) -> None:
+        ts = float(now if now is not None else time.time())
+        expired_inbound = [
+            rid
+            for rid, req in pending_pair_requests.items()
+            if ts - float(req.get("created_at", 0)) > pair_request_ttl_seconds
+        ]
+        for rid in expired_inbound:
+            pending_pair_requests.pop(rid, None)
+
+        expired_outbound = [
+            rid
+            for rid, req in outgoing_pair_requests.items()
+            if ts - float(req.get("created_at", 0)) > pair_request_ttl_seconds
+        ]
+        for rid in expired_outbound:
+            outgoing_pair_requests.pop(rid, None)
+
+    def list_discovered_desktops() -> list[dict]:
+        with lock:
+            cleanup_discovered_desktops_locked()
+            rows = []
+            for device_id, peer in discovered_desktops.items():
+                rows.append(
+                    {
+                        "device_id": device_id,
+                        "device_name": peer["device_name"],
+                        "host": peer["host"],
+                        "port": int(peer["port"]),
+                        "last_seen_at": int(peer["last_seen_at"]),
+                        "paired": device_id in paired_desktops,
+                    }
+                )
+        rows.sort(key=lambda item: item["device_name"])
+        return rows
+
+    def list_paired_desktops() -> list[dict]:
+        with lock:
+            cleanup_discovered_desktops_locked()
+            rows = []
+            for device_id, peer in paired_desktops.items():
+                discovered = discovered_desktops.get(device_id)
+                host = str(peer.get("host") or "").strip()
+                port = parse_peer_port(peer.get("port"))
+                if discovered is not None:
+                    discovered_host = str(discovered.get("host") or "").strip()
+                    discovered_port = parse_peer_port(discovered.get("port"))
+                    if discovered_host:
+                        host = discovered_host
+                    if discovered_port is not None:
+                        port = discovered_port
+                if not host or port is None:
+                    continue
+                rows.append(
+                    {
+                        "device_id": device_id,
+                        "device_name": normalize_peer_name(peer.get("device_name"), fallback=f"电脑-{device_id[:8]}"),
+                        "host": host,
+                        "port": port,
+                        "paired_at": int(peer.get("paired_at", int(time.time()))),
+                        "online": discovered is not None,
+                        "last_seen_at": int(discovered["last_seen_at"]) if discovered is not None else 0,
+                    }
+                )
+        rows.sort(key=lambda item: item["device_name"])
+        return rows
+
+    def list_pending_pair_requests() -> list[dict]:
+        with lock:
+            cleanup_pair_requests_locked()
+            rows = []
+            for request_id, req in pending_pair_requests.items():
+                rows.append(
+                    {
+                        "request_id": request_id,
+                        "from_device_id": req["from_device_id"],
+                        "from_device_name": req["from_device_name"],
+                        "from_host": req["from_host"],
+                        "from_port": int(req["from_port"]),
+                        "created_at": int(req["created_at"]),
+                    }
+                )
+        rows.sort(key=lambda item: item["created_at"], reverse=True)
+        return rows
+
+    def post_json(url: str, payload: dict, timeout: float = 4.0) -> tuple[int, dict]:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            text = body.decode("utf-8", errors="ignore") if body else ""
+            data = json.loads(text) if text else {}
+            return int(getattr(resp, "status", 200)), data
+
+    def notify_desktop_clients(event: dict) -> None:
+        broadcast(event, target_device_id=DESKTOP_DEVICE_ID)
+
+    def send_pairing_response_callback(
+        target_base_url: str,
+        request_id: str,
+        accepted: bool,
+        reason: str,
+    ) -> tuple[bool, str]:
+        callback_url = f"{target_base_url.rstrip('/')}/pairing/response"
+        payload = {
+            "request_id": request_id,
+            "accepted": bool(accepted),
+            "reason": reason,
+            "responder_device_id": self_device_id,
+            "responder_device_name": self_device_name,
+            "responder_port": int(app.config["HTTP_PORT"]),
+        }
+        try:
+            status, data = post_json(callback_url, payload, timeout=4.0)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return False, str(exc)
+        if status >= 400:
+            return False, str(data.get("error") or f"HTTP {status}")
+        return True, ""
+
+    def load_paired_desktops() -> None:
+        settings = load_runtime_settings()
+        payload = settings.get("paired_desktops")
+        if not isinstance(payload, list):
+            return
+        now = int(time.time())
+        with lock:
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                device_id = normalize_device_id(item.get("device_id"))
+                if not device_id or device_id == self_device_id:
+                    continue
+                host = str(item.get("host") or "").strip()
+                if not host:
+                    continue
+                try:
+                    port = int(item.get("port"))
+                except (TypeError, ValueError):
+                    continue
+                if port <= 0 or port > 65535:
+                    continue
+                paired_desktops[device_id] = {
+                    "device_name": normalize_peer_name(item.get("device_name"), fallback=f"电脑-{device_id[:8]}"),
+                    "host": host,
+                    "port": port,
+                    "paired_at": int(item.get("paired_at") or now),
+                    "last_seen_at": 0,
+                }
+
+    def get_requested_desktop_target_id() -> str:
+        return normalize_device_id(request.headers.get("X-Target-Device-Id"))
+
+    def get_paired_peer_snapshot(device_id: str) -> Optional[dict]:
+        target_id = normalize_device_id(device_id)
+        if not target_id:
+            return None
+        with lock:
+            peer = paired_desktops.get(target_id)
+            if peer is None:
+                return None
+            discovered = discovered_desktops.get(target_id)
+            host = ""
+            port = None
+            if discovered is not None:
+                host = str(discovered.get("host") or "").strip()
+                port = parse_peer_port(discovered.get("port"))
+            if not host:
+                host = str(peer.get("host") or "").strip()
+            if port is None:
+                port = parse_peer_port(peer.get("port"))
+            if not host or port is None:
+                return None
+            return {
+                "device_id": target_id,
+                "device_name": normalize_peer_name(peer.get("device_name"), fallback=f"电脑-{target_id[:8]}"),
+                "host": host,
+                "port": port,
+            }
+
+    def build_relay_read_timeout_seconds(file_size_hint: int = 0) -> int:
+        safe_size = max(0, int(file_size_hint or 0))
+        # 按最低约 256KB/s 估算，给慢速网络和大文件更充足超时窗口
+        dynamic = 120 + int(safe_size / (256 * 1024))
+        return max(120, min(1800, dynamic))
+
+    def check_peer_health(host: str, port: int) -> bool:
+        url = f"http://{host}:{int(port)}/health"
+        try:
+            resp = requests.get(url, timeout=(0.35, 0.6))
+        except requests.RequestException:
+            return False
+        return resp.status_code == 200
+
+    def find_reachable_paired_peer(
+        device_id: str,
+        exclude_endpoint: Optional[tuple[str, int]] = None,
+    ) -> Optional[dict]:
+        target_id = normalize_device_id(device_id)
+        if not target_id:
+            return None
+        with lock:
+            peer = paired_desktops.get(target_id)
+            if peer is None:
+                return None
+            discovered = discovered_desktops.get(target_id)
+            host_candidates = []
+            for host in (
+                str(discovered["host"]) if discovered is not None else "",
+                str(peer.get("host") or ""),
+            ):
+                if host and host not in host_candidates:
+                    host_candidates.append(host)
+            seed_ports = []
+            discovered_port = parse_peer_port(discovered.get("port")) if discovered is not None else None
+            peer_port = parse_peer_port(peer.get("port"))
+            for value in (discovered_port, peer_port):
+                if value is not None and value not in seed_ports:
+                    seed_ports.append(value)
+            device_name = str(peer.get("device_name") or f"电脑-{target_id[:8]}")
+
+        for host in host_candidates:
+            candidate_ports = []
+            for seed in seed_ports:
+                if seed not in candidate_ports:
+                    candidate_ports.append(seed)
+                for offset in (
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                    17,
+                    18,
+                    19,
+                    20,
+                    21,
+                    22,
+                    23,
+                    24,
+                    25,
+                    26,
+                    27,
+                    28,
+                    29,
+                    30,
+                    -1,
+                    -2,
+                    -3,
+                    -4,
+                    -5,
+                    -6,
+                    -7,
+                    -8,
+                    -9,
+                    -10,
+                ):
+                    maybe = seed + offset
+                    if 1 <= maybe <= 65535 and maybe not in candidate_ports:
+                        candidate_ports.append(maybe)
+            for fallback_port in range(5000, 5051):
+                if fallback_port not in candidate_ports:
+                    candidate_ports.append(fallback_port)
+
+            for port in candidate_ports:
+                endpoint = (host, int(port))
+                if exclude_endpoint is not None and endpoint == exclude_endpoint:
+                    continue
+                if not check_peer_health(host, port):
+                    continue
+                with lock:
+                    refresh_discovered_from_peer_locked(target_id, device_name, host, int(port), seen_at=time.time())
+                persist_paired_desktops()
+                return {
+                    "device_id": target_id,
+                    "device_name": device_name,
+                    "host": host,
+                    "port": int(port),
+                }
+        return None
+
+    def resolve_desktop_transfer_target(target_device_id: str) -> tuple[str, str, Optional[dict], Optional[str]]:
+        normalized_target = normalize_device_id(target_device_id)
+        if not normalized_target:
+            mobile_id, mobile_name = preferred_mobile_device_for_desktop()
+            return mobile_id, mobile_name, None, None
+        target_peer = get_paired_peer_snapshot(normalized_target)
+        if target_peer is None:
+            return "", "", None, "目标电脑未配对或不可用"
+        return target_peer["device_id"], target_peer["device_name"], target_peer, None
+
+    def relay_file_to_paired_desktop(
+        *,
+        target_peer: dict,
+        file_name: str,
+        file_stream,
+        file_size_hint: int = 0,
+    ) -> tuple[bool, Optional[str], dict]:
+        headers = {
+            "X-Peer-Device-Id": self_device_id,
+            "X-Peer-Device-Name": encode_header_text(
+                self_device_name, fallback=f"desktop-{self_device_id[:8]}"
+            ),
+            "X-Peer-Port": str(int(app.config["HTTP_PORT"])),
+        }
+        read_timeout = build_relay_read_timeout_seconds(file_size_hint)
+        endpoint_candidates = [target_peer]
+
+        last_error = ""
+        last_payload: dict = {}
+        idx = 0
+        while idx < len(endpoint_candidates):
+            peer_endpoint = endpoint_candidates[idx]
+            if idx > 0 and hasattr(file_stream, "seek"):
+                try:
+                    file_stream.seek(0)
+                except Exception:
+                    pass
+            peer_host = str(peer_endpoint.get("host") or "").strip()
+            peer_port = parse_peer_port(peer_endpoint.get("port"))
+            if not peer_host or peer_port is None:
+                last_error = "目标设备地址无效，请删除配对后重新配对"
+                idx += 1
+                continue
+            relay_url = f"http://{peer_host}:{peer_port}/peer/upload"
+            try:
+                response = requests.post(
+                    relay_url,
+                    headers=headers,
+                    data={"source_device_name": self_device_name},
+                    files={"file": (file_name, file_stream, "application/octet-stream")},
+                    timeout=(5, read_timeout),
+                )
+            except requests.RequestException as exc:
+                last_error = f"目标设备不可达: {exc}"
+                if idx == 0:
+                    exclude_port = parse_peer_port(target_peer.get("port")) or 0
+                    alt_peer = find_reachable_paired_peer(
+                        str(target_peer.get("device_id") or ""),
+                        exclude_endpoint=(str(target_peer.get("host") or ""), exclude_port),
+                    )
+                    if alt_peer is not None:
+                        endpoint_candidates.append(alt_peer)
+                idx += 1
+                continue
+
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            last_payload = payload
+            if response.status_code < 400:
+                with lock:
+                    refresh_discovered_from_peer_locked(
+                        str(peer_endpoint["device_id"]),
+                        str(peer_endpoint["device_name"]),
+                        peer_host,
+                        peer_port,
+                        seen_at=time.time(),
+                    )
+                persist_paired_desktops()
+                return True, None, payload
+            last_error = str(payload.get("error") or f"目标设备返回错误: HTTP {response.status_code}")
+            if idx == 0 and response.status_code in (404, 500, 502, 503, 504):
+                exclude_port = parse_peer_port(target_peer.get("port")) or 0
+                alt_peer = find_reachable_paired_peer(
+                    str(target_peer.get("device_id") or ""),
+                    exclude_endpoint=(str(target_peer.get("host") or ""), exclude_port),
+                )
+                if alt_peer is not None:
+                    endpoint_candidates.append(alt_peer)
+            idx += 1
+
+        return False, (last_error or "发送到目标设备失败"), last_payload
+
+    def record_desktop_send_history(
+        *,
+        file_name: str,
+        file_path: str,
+        file_size: int,
+        device_id: str,
+        device_name: str,
+    ) -> tuple[Optional[dict], Optional[str]]:
+        history_id = uuid.uuid4().hex
+        created_at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            insert_history_record(
+                history_id=history_id,
+                device_id=device_id,
+                device_name=device_name,
+                file_name=file_name,
+                file_path=file_path,
+                direction="上传",
+                status="成功",
+                file_size=max(0, int(file_size or 0)),
+                source="desktop",
+                timestamp_text=created_at_text,
+            )
+        except Exception as exc:
+            return None, f"写入历史记录失败: {exc}"
+
+        send_history_event(history_id, target_device_id=DESKTOP_DEVICE_ID)
+        row = history_row_by_id(history_id)
+        if row is None:
+            return None, "历史记录不存在"
+        return public_history_record(row, include_file_path=True), None
 
     def insert_history_record(
         *,
@@ -499,7 +1044,80 @@ def create_app(
                 for ws in dead:
                     clients.pop(ws, None)
 
+    def run_peer_discovery() -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            listener.bind(("0.0.0.0", peer_discovery_port))
+            sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+            next_announce_at = 0.0
+            while True:
+                now = time.time()
+                if now >= next_announce_at:
+                    announce_payload = {
+                        "type": "lft_announce",
+                        "device_id": self_device_id,
+                        "device_name": self_device_name,
+                        "http_port": int(app.config["HTTP_PORT"]),
+                        "ts": int(now),
+                    }
+                    packet = json.dumps(announce_payload, ensure_ascii=False).encode("utf-8")
+                    try:
+                        sender.sendto(packet, ("255.255.255.255", peer_discovery_port))
+                    except OSError:
+                        pass
+                    next_announce_at = now + peer_announce_interval
+
+                wait_seconds = max(0.2, min(1.0, next_announce_at - now))
+                listener.settimeout(wait_seconds)
+                try:
+                    packet, addr = listener.recvfrom(4096)
+                except socket.timeout:
+                    with lock:
+                        cleanup_discovered_desktops_locked()
+                        cleanup_pair_requests_locked()
+                    continue
+                except OSError:
+                    break
+
+                host = str(addr[0] or "").strip()
+                if not host:
+                    continue
+                try:
+                    message = json.loads(packet.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if message.get("type") != "lft_announce":
+                    continue
+                peer_device_id = normalize_device_id(message.get("device_id"))
+                if not peer_device_id or peer_device_id == self_device_id:
+                    continue
+                try:
+                    peer_port = int(message.get("http_port"))
+                except (TypeError, ValueError):
+                    continue
+                if peer_port <= 0 or peer_port > 65535:
+                    continue
+                peer_name = normalize_peer_name(message.get("device_name"), fallback=f"电脑-{peer_device_id[:8]}")
+                with lock:
+                    refresh_discovered_from_peer_locked(
+                        peer_device_id, peer_name, host, peer_port, seen_at=time.time()
+                    )
+                    cleanup_discovered_desktops_locked()
+                    cleanup_pair_requests_locked()
+        finally:
+            listener.close()
+            sender.close()
+
+    def start_peer_discovery() -> None:
+        threading.Thread(target=run_peer_discovery, daemon=True, name="lft-peer-discovery").start()
+
     ensure_history_schema()
+    load_paired_desktops()
+    start_peer_discovery()
 
     def is_trusted_desktop(ip: Optional[str]) -> bool:
         return bool(ip and ip in trusted_desktop_ips)
@@ -694,6 +1312,284 @@ def create_app(
             }
         )
 
+    @app.get("/peers/discovered")
+    def get_discovered_peers():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可查看设备列表"}), 403
+        return jsonify(
+            {
+                "self": {
+                    "device_id": self_device_id,
+                    "device_name": self_device_name,
+                    "host": lan_ip,
+                    "port": int(app.config["HTTP_PORT"]),
+                },
+                "devices": list_discovered_desktops(),
+            }
+        )
+
+    @app.get("/peers/paired")
+    def get_paired_peers():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可查看配对设备"}), 403
+        return jsonify({"devices": list_paired_desktops()})
+
+    @app.delete("/peers/paired/<device_id>")
+    def delete_paired_peer(device_id: str):
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可删除配对设备"}), 403
+        normalized_device_id = normalize_device_id(device_id)
+        if not normalized_device_id:
+            return jsonify({"error": "设备标识无效"}), 400
+        with lock:
+            removed = paired_desktops.pop(normalized_device_id, None)
+        if removed is None:
+            return jsonify({"error": "配对设备不存在"}), 404
+        persist_paired_desktops()
+        notify_desktop_clients({"type": "pairing_list_updated"})
+        return jsonify({"ok": True, "device_id": normalized_device_id})
+
+    @app.post("/peers/pair-request")
+    def send_pair_request():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可发起配对"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        target_device_id = normalize_device_id(payload.get("target_device_id"))
+        if not target_device_id:
+            return jsonify({"error": "缺少目标设备标识"}), 400
+        if target_device_id == self_device_id:
+            return jsonify({"error": "不能向当前设备发起配对"}), 400
+
+        with lock:
+            cleanup_discovered_desktops_locked()
+            target_peer = discovered_desktops.get(target_device_id)
+            if target_peer is None:
+                return jsonify({"error": "目标设备不在线，请稍后重试"}), 404
+            target_host = target_peer["host"]
+            target_port = int(target_peer["port"])
+            target_name = target_peer["device_name"]
+
+        request_id = uuid.uuid4().hex
+        req_payload = {
+            "request_id": request_id,
+            "from_device_id": self_device_id,
+            "from_device_name": self_device_name,
+            "from_port": int(app.config["HTTP_PORT"]),
+            "from_base_url": app.config["BASE_URL"],
+            "sent_at": int(time.time()),
+        }
+        target_url = f"http://{target_host}:{target_port}/pairing/request"
+        try:
+            status, data = post_json(target_url, req_payload, timeout=4.0)
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            message = ""
+            if body:
+                try:
+                    parsed = json.loads(body.decode("utf-8", errors="ignore"))
+                    message = str(parsed.get("error") or "")
+                except json.JSONDecodeError:
+                    message = ""
+            return jsonify({"error": message or f"请求失败: HTTP {exc.code}"}), 502
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return jsonify({"error": f"设备不可达: {exc}"}), 502
+        if status >= 400:
+            return jsonify({"error": str(data.get('error') or f'请求失败: HTTP {status}')}), 502
+
+        with lock:
+            outgoing_pair_requests[request_id] = {
+                "request_id": request_id,
+                "target_device_id": target_device_id,
+                "target_device_name": target_name,
+                "target_host": target_host,
+                "target_port": target_port,
+                "created_at": int(time.time()),
+            }
+            cleanup_pair_requests_locked()
+
+        return jsonify({"ok": True, "request_id": request_id, "target_device_name": target_name})
+
+    @app.get("/pairing/pending")
+    def get_pending_pair_requests():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可查看配对请求"}), 403
+        return jsonify({"requests": list_pending_pair_requests()})
+
+    @app.post("/pairing/request")
+    def receive_pairing_request():
+        payload = request.get_json(silent=True) or {}
+        request_id = normalize_device_identifier(payload.get("request_id"), max_len=64)
+        from_device_id = normalize_device_id(payload.get("from_device_id"))
+        if not request_id or not from_device_id:
+            return jsonify({"error": "请求参数无效"}), 400
+        if from_device_id == self_device_id:
+            return jsonify({"error": "无效的请求来源"}), 400
+
+        from_host = str(request.remote_addr or "").strip()
+        if not from_host:
+            return jsonify({"error": "无法识别设备地址"}), 400
+
+        try:
+            from_port = int(payload.get("from_port"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "请求端口无效"}), 400
+        if from_port <= 0 or from_port > 65535:
+            return jsonify({"error": "请求端口无效"}), 400
+
+        from_device_name = normalize_peer_name(payload.get("from_device_name"), fallback=f"电脑-{from_device_id[:8]}")
+        from_base_url = str(payload.get("from_base_url") or "").strip()
+        if not from_base_url:
+            from_base_url = f"http://{from_host}:{from_port}"
+
+        auto_accept = False
+        request_snapshot = {}
+        with lock:
+            refresh_discovered_from_peer_locked(from_device_id, from_device_name, from_host, from_port, seen_at=time.time())
+            existing_pair = paired_desktops.get(from_device_id)
+            if existing_pair is not None:
+                existing_pair["device_name"] = from_device_name
+                existing_pair["host"] = from_host
+                existing_pair["port"] = from_port
+                existing_pair["last_seen_at"] = int(time.time())
+                auto_accept = True
+            else:
+                pending_pair_requests[request_id] = {
+                    "request_id": request_id,
+                    "from_device_id": from_device_id,
+                    "from_device_name": from_device_name,
+                    "from_host": from_host,
+                    "from_port": from_port,
+                    "from_base_url": from_base_url,
+                    "created_at": int(time.time()),
+                }
+                cleanup_pair_requests_locked()
+                request_snapshot = {
+                    "request_id": request_id,
+                    "from_device_id": from_device_id,
+                    "from_device_name": from_device_name,
+                    "from_host": from_host,
+                    "from_port": from_port,
+                    "created_at": int(time.time()),
+                }
+
+        if auto_accept:
+            persist_paired_desktops()
+            ok, error = send_pairing_response_callback(from_base_url, request_id, True, "")
+            notify_desktop_clients(
+                {
+                    "type": "pairing_result",
+                    "accepted": True,
+                    "device_id": from_device_id,
+                    "device_name": from_device_name,
+                    "auto": True,
+                    "callback_ok": ok,
+                    "callback_error": error,
+                }
+            )
+            return jsonify({"ok": True, "auto_accepted": True})
+
+        notify_desktop_clients({"type": "pairing_request", "request": request_snapshot})
+        return jsonify({"ok": True})
+
+    @app.post("/pairing/respond")
+    def respond_pair_request():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可处理配对请求"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        request_id = normalize_device_identifier(payload.get("request_id"), max_len=64)
+        if not request_id:
+            return jsonify({"error": "缺少请求标识"}), 400
+        accepted = bool(payload.get("accepted"))
+
+        with lock:
+            req = pending_pair_requests.pop(request_id, None)
+        if req is None:
+            return jsonify({"error": "配对请求不存在或已过期"}), 404
+
+        callback_base_url = req.get("from_base_url") or f"http://{req['from_host']}:{int(req['from_port'])}"
+        callback_ok, callback_error = send_pairing_response_callback(callback_base_url, request_id, accepted, "")
+
+        if accepted:
+            with lock:
+                paired_desktops[req["from_device_id"]] = {
+                    "device_name": req["from_device_name"],
+                    "host": req["from_host"],
+                    "port": int(req["from_port"]),
+                    "paired_at": int(time.time()),
+                    "last_seen_at": int(time.time()),
+                }
+            persist_paired_desktops()
+
+        notify_desktop_clients(
+            {
+                "type": "pairing_result",
+                "accepted": accepted,
+                "device_id": req["from_device_id"],
+                "device_name": req["from_device_name"],
+                "callback_ok": callback_ok,
+                "callback_error": callback_error,
+            }
+        )
+        notify_desktop_clients({"type": "pairing_list_updated"})
+        return jsonify({"ok": True, "accepted": accepted, "callback_ok": callback_ok, "callback_error": callback_error})
+
+    @app.post("/pairing/response")
+    def receive_pair_response():
+        payload = request.get_json(silent=True) or {}
+        request_id = normalize_device_identifier(payload.get("request_id"), max_len=64)
+        if not request_id:
+            return jsonify({"error": "缺少请求标识"}), 400
+
+        with lock:
+            req = outgoing_pair_requests.pop(request_id, None)
+        if req is None:
+            return jsonify({"error": "配对请求不存在或已过期"}), 404
+
+        accepted = bool(payload.get("accepted"))
+        responder_device_id = normalize_device_id(payload.get("responder_device_id")) or req["target_device_id"]
+        responder_device_name = normalize_peer_name(payload.get("responder_device_name"), fallback=req["target_device_name"])
+        responder_host = str(request.remote_addr or req["target_host"]).strip() or req["target_host"]
+        try:
+            responder_port = int(payload.get("responder_port"))
+        except (TypeError, ValueError):
+            responder_port = int(req["target_port"])
+        if responder_port <= 0 or responder_port > 65535:
+            responder_port = int(req["target_port"])
+
+        with lock:
+            refresh_discovered_from_peer_locked(
+                responder_device_id,
+                responder_device_name,
+                responder_host,
+                responder_port,
+                seen_at=time.time(),
+            )
+            if accepted:
+                paired_desktops[responder_device_id] = {
+                    "device_name": responder_device_name,
+                    "host": responder_host,
+                    "port": responder_port,
+                    "paired_at": int(time.time()),
+                    "last_seen_at": int(time.time()),
+                }
+
+        if accepted:
+            persist_paired_desktops()
+
+        notify_desktop_clients(
+            {
+                "type": "pairing_result",
+                "accepted": accepted,
+                "device_id": responder_device_id,
+                "device_name": responder_device_name,
+                "reason": str(payload.get("reason") or ""),
+            }
+        )
+        notify_desktop_clients({"type": "pairing_list_updated"})
+        return jsonify({"ok": True, "accepted": accepted})
+
     @app.post("/settings/upload-limit")
     def update_upload_limit():
         if not is_trusted_desktop(request.remote_addr):
@@ -815,6 +1711,139 @@ def create_app(
 
         return jsonify({"ok": True, "file": str(entry_path)})
 
+    @app.post("/peer/upload")
+    def receive_peer_upload():
+        source_peer_device_id = normalize_device_id(request.headers.get("X-Peer-Device-Id"))
+        if not source_peer_device_id:
+            return jsonify({"error": "缺少来源设备标识"}), 400
+        source_peer_name_header = decode_header_text(request.headers.get("X-Peer-Device-Name"))
+        source_peer_name_hint = normalize_peer_name(
+            source_peer_name_header,
+            fallback=f"电脑-{source_peer_device_id[:8]}",
+        )
+
+        remote_ip = str(request.remote_addr or "").strip()
+        if not remote_ip:
+            return jsonify({"error": "无法识别来源地址"}), 400
+
+        with lock:
+            peer = paired_desktops.get(source_peer_device_id)
+            if peer is None:
+                same_host_peers = [
+                    (peer_id, peer_item)
+                    for peer_id, peer_item in paired_desktops.items()
+                    if str(peer_item.get("host") or "") == remote_ip
+                ]
+                chosen: Optional[tuple[str, dict]] = None
+                if same_host_peers:
+                    name_matched = [
+                        item
+                        for item in same_host_peers
+                        if normalize_peer_name(item[1].get("device_name"), fallback="") == source_peer_name_hint
+                    ]
+                    pool = name_matched if name_matched else same_host_peers
+                    chosen = max(pool, key=lambda item: int(item[1].get("paired_at") or 0))
+                elif paired_desktops:
+                    name_candidates = [
+                        (peer_id, peer_item)
+                        for peer_id, peer_item in paired_desktops.items()
+                        if normalize_peer_name(peer_item.get("device_name"), fallback="") == source_peer_name_hint
+                    ]
+                    if len(name_candidates) == 1:
+                        chosen = name_candidates[0]
+
+                if chosen is not None:
+                    old_peer_id, old_peer = chosen
+                    paired_desktops.pop(old_peer_id, None)
+                    paired_desktops[source_peer_device_id] = old_peer
+                    peer = old_peer
+                else:
+                    return jsonify({"error": "未配对设备，拒绝接收文件"}), 403
+            peer_name = normalize_peer_name(
+                source_peer_name_header,
+                fallback=str(peer.get("device_name") or f"电脑-{source_peer_device_id[:8]}"),
+            )
+            peer["device_name"] = peer_name
+            peer["host"] = remote_ip
+            try:
+                remote_port = int(request.headers.get("X-Peer-Port"))
+            except (TypeError, ValueError):
+                remote_port = int(peer.get("port") or 0)
+            if 1 <= remote_port <= 65535:
+                peer["port"] = remote_port
+            peer["last_seen_at"] = int(time.time())
+
+        persist_paired_desktops()
+
+        uploaded = request.files.get("file")
+        if uploaded is None or uploaded.filename == "":
+            return jsonify({"error": "缺少文件"}), 400
+
+        original_name = uploaded.filename.strip()
+        target_dir = Path(app.config["DOWNLOAD_DIR"]).resolve()
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return jsonify({"error": f"保存目录不可用: {exc}"}), 500
+
+        destination = allocate_unique_file_path(target_dir, original_name)
+        max_upload_bytes_local = app.config["MAX_UPLOAD_BYTES"]
+        content_len = request.content_length
+        if content_len is not None and content_len > max_upload_bytes_local + 1024 * 1024:
+            return jsonify({"error": "上传文件超过大小限制"}), 413
+
+        try:
+            size = stream_to_disk(uploaded.stream, destination, max_bytes=max_upload_bytes_local)
+        except Exception as exc:
+            if destination.exists():
+                destination.unlink(missing_ok=True)
+            if isinstance(exc, ValueError):
+                return jsonify({"error": str(exc)}), 413
+            return jsonify({"error": f"保存失败: {exc}"}), 500
+
+        transfer_id = uuid.uuid4().hex
+        created_at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        record = {
+            "id": transfer_id,
+            "name": destination.name,
+            "size": size,
+            "source": "desktop",
+            "created_at": created_at_text,
+            "path": destination,
+            "transient": False,
+            "device_id": source_peer_device_id,
+            "device_name": peer_name,
+            "direction": "上传",
+            "status": "成功",
+        }
+
+        with lock:
+            records.append(record)
+            record_map[transfer_id] = record
+
+        try:
+            insert_history_record(
+                history_id=transfer_id,
+                device_id=source_peer_device_id,
+                device_name=peer_name,
+                file_name=destination.name,
+                file_path=str(destination),
+                direction="上传",
+                status="成功",
+                file_size=size,
+                source="desktop",
+                timestamp_text=created_at_text,
+            )
+        except Exception as exc:
+            remove_record_and_file(transfer_id)
+            return jsonify({"error": f"写入历史记录失败: {exc}"}), 500
+
+        send_history_event(transfer_id, target_device_id=DESKTOP_DEVICE_ID)
+        row = history_row_by_id(transfer_id)
+        if row is None:
+            return jsonify({"error": "历史记录不存在"}), 500
+        return jsonify({"ok": True, "size": size, "record": public_history_record(row, include_file_path=True)})
+
     @app.post("/upload-desktop-path")
     def upload_desktop_path():
         if not is_trusted_desktop(request.remote_addr):
@@ -832,14 +1861,46 @@ def create_app(
         if not source_path.exists() or not source_path.is_file():
             return jsonify({"error": "源文件不存在"}), 404
 
-        transfer_id = uuid.uuid4().hex
-        device_id, device_name = preferred_mobile_device_for_desktop()
-        created_at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        target_device_id = get_requested_desktop_target_id()
+        device_id, device_name, target_peer, target_error = resolve_desktop_transfer_target(target_device_id)
+        if target_error:
+            return jsonify({"error": target_error}), 400
 
         try:
             file_size = int(source_path.stat().st_size)
         except Exception as exc:
             return jsonify({"error": f"读取文件信息失败: {exc}"}), 500
+
+        if target_peer is not None:
+            try:
+                with source_path.open("rb") as fp:
+                    ok, error, _payload = relay_file_to_paired_desktop(
+                        target_peer=target_peer,
+                        file_name=source_path.name,
+                        file_stream=fp,
+                        file_size_hint=file_size,
+                    )
+            except OSError as exc:
+                return jsonify({"error": f"读取源文件失败: {exc}"}), 500
+            except Exception as exc:
+                return jsonify({"error": f"发送到目标电脑失败: {exc}"}), 502
+
+            if not ok:
+                return jsonify({"error": error or "发送到目标电脑失败"}), 502
+
+            public_record, history_error = record_desktop_send_history(
+                file_name=source_path.name,
+                file_path=str(source_path),
+                file_size=file_size,
+                device_id=device_id,
+                device_name=device_name,
+            )
+            if history_error:
+                return jsonify({"error": history_error}), 500
+            return jsonify({"ok": True, "record": public_record, "relayed": True})
+
+        transfer_id = uuid.uuid4().hex
+        created_at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         record = {
             "id": transfer_id,
@@ -892,8 +1953,12 @@ def create_app(
         uploaded = request.files.get("file")
         source = "desktop" if is_trusted_desktop(request.remote_addr) else "mobile"
         if source == "desktop":
-            device_id, device_name = preferred_mobile_device_for_desktop()
+            target_device_id = get_requested_desktop_target_id()
+            device_id, device_name, target_peer, target_error = resolve_desktop_transfer_target(target_device_id)
+            if target_error:
+                return jsonify({"error": target_error}), 400
         else:
+            target_peer = None
             try:
                 device_id, device_name, _ = resolve_request_device()
             except ValueError as exc:
@@ -924,6 +1989,42 @@ def create_app(
         content_len = request.content_length
         if content_len is not None and content_len > max_upload_bytes_local + 1024 * 1024:
             return jsonify({"error": "上传文件超过大小限制"}), 413
+
+        if source == "desktop" and target_peer is not None:
+            size_hint = 0
+            try:
+                size_hint = int(uploaded.content_length or 0)
+            except (TypeError, ValueError):
+                size_hint = 0
+            try:
+                ok, error, payload = relay_file_to_paired_desktop(
+                    target_peer=target_peer,
+                    file_name=original_name,
+                    file_stream=uploaded.stream,
+                    file_size_hint=size_hint,
+                )
+            except Exception as exc:
+                return jsonify({"error": f"发送到目标电脑失败: {exc}"}), 502
+            if not ok:
+                return jsonify({"error": error or "发送到目标电脑失败"}), 502
+
+            relayed_size = 0
+            try:
+                relayed_size = int(payload.get("size") or 0)
+            except (TypeError, ValueError):
+                relayed_size = 0
+            effective_size = relayed_size if relayed_size > 0 else max(0, size_hint)
+
+            public_record, history_error = record_desktop_send_history(
+                file_name=original_name,
+                file_path=f"[relay]{original_name}",
+                file_size=effective_size,
+                device_id=device_id,
+                device_name=device_name,
+            )
+            if history_error:
+                return jsonify({"error": history_error}), 500
+            return jsonify({"ok": True, "record": public_record, "relayed": True})
 
         try:
             size = stream_to_disk(uploaded.stream, destination, max_bytes=max_upload_bytes_local)
@@ -1193,12 +2294,16 @@ def start_server(
     runtime_download_dir = normalize_download_dir(str(runtime_settings.get("download_dir", "")))
     if runtime_download_dir is None:
         runtime_download_dir = default_download_dir()
+    local_device_id, local_device_name = load_or_create_local_device_identity()
 
     app = create_app(
         upload_dir=upload_dir,
         transient_upload_dir=transient_upload_dir,
         base_url=base_url,
         lan_ip=lan_ip,
+        http_port=selected_port,
+        local_device_id=local_device_id,
+        local_device_name=local_device_name,
         initial_mobile_token=initial_mobile_token,
         max_upload_bytes=runtime_max_upload,
         download_dir=runtime_download_dir,
