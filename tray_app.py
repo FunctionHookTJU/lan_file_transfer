@@ -20,6 +20,9 @@ except Exception:
 import app as backend
 
 ERROR_ALREADY_EXISTS = 183
+MAIN_WINDOW_TITLE = "LAN File Transfer"
+SW_SHOW = 5
+SW_RESTORE = 9
 
 
 def resource_path(filename: str) -> Path:
@@ -77,6 +80,27 @@ def show_popup(message: str, title: str = "LAN 文件传输") -> None:
         ctypes.windll.user32.MessageBoxW(None, message, title, 0x40)
     except Exception:
         print(f"{title}: {message}")
+
+
+def bring_running_window_to_front(window_title: str = MAIN_WINDOW_TITLE, timeout: float = 4.0) -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+
+    deadline = time.time() + timeout
+    user32 = ctypes.windll.user32
+    while time.time() < deadline:
+        hwnd = user32.FindWindowW(None, window_title)
+        if hwnd:
+            try:
+                user32.ShowWindow(hwnd, SW_SHOW)
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                user32.SetForegroundWindow(hwnd)
+                user32.BringWindowToTop(hwnd)
+            except Exception:
+                return False
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def state_file_path() -> Path:
@@ -350,15 +374,13 @@ class TrayController:
         if not self.start_backend():
             show_popup("后端服务启动失败，请检查端口占用或防火墙策略。")
             return
-        if self.port != self.requested_port:
-            show_popup(f"端口 {self.requested_port} 被占用，已切换到 {self.port}")
 
         tray_thread = threading.Thread(target=self.run_tray, daemon=True)
         tray_thread.start()
 
         api = DesktopBridgeApi()
         self.window = webview.create_window(
-            title="LAN File Transfer",
+            title=MAIN_WINDOW_TITLE,
             url=self.desktop_url(),
             js_api=api,
             width=1080,
@@ -404,11 +426,7 @@ def main() -> None:
 
     guard = SingleInstanceGuard("LANFileTransfer.Tray.Singleton")
     if not guard.acquire():
-        active_port = read_active_port(args.port)
-        if service_is_ready(active_port, timeout=6.0):
-            show_popup("程序已在运行，请切换到已有窗口。")
-        else:
-            show_popup("程序已在运行。")
+        bring_running_window_to_front()
         return
 
     try:
