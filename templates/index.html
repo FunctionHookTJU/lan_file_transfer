@@ -478,6 +478,39 @@
       to { box-shadow: 0 0 0 4px rgba(29, 78, 216, 0.1); }
     }
 
+    .confirm-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.46);
+      z-index: 200;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .confirm-overlay.show { display: flex; }
+    .confirm-box {
+      background: #fbfdff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 20px;
+      width: min(360px, 90vw);
+      box-shadow: 0 16px 48px rgba(15, 23, 42, 0.2);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .confirm-msg {
+      font-size: 13px;
+      color: var(--txt);
+      line-height: 1.5;
+    }
+    .confirm-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
   </style>
 </head>
 <body>
@@ -558,6 +591,16 @@
         <div class="peer-list" id="pairedDevices"></div>
       </div>
       <div class="setting-note" id="secureNote">默认下载目录为 Windows Downloads，上传上限默认 10GB；电脑互传可在上方设备列表发起并确认配对。</div>
+    </div>
+  </div>
+
+  <div class="confirm-overlay" id="confirmOverlay">
+    <div class="confirm-box">
+      <div class="confirm-msg" id="confirmMsg"></div>
+      <div class="confirm-actions">
+        <button class="btn" id="confirmCancelBtn" type="button">取消</button>
+        <button class="btn danger" id="confirmOkBtn" type="button">确认</button>
+      </div>
     </div>
   </div>
 
@@ -676,13 +719,13 @@
     }
 
     function makeFallbackUuid() {
-      const seed = `${Date.now()}-${Math.random()}-${Math.random()}`;
-      let hex = '';
-      for (let i = 0; i < seed.length; i += 1) {
-        hex += seed.charCodeAt(i).toString(16);
-      }
-      const padded = (hex + '00000000000000000000000000000000').slice(0, 32);
-      return `${padded.slice(0, 8)}-${padded.slice(8, 12)}-${padded.slice(12, 16)}-${padded.slice(16, 20)}-${padded.slice(20, 32)}`;
+      // 使用 crypto.getRandomValues 生成符合 UUID v4 规范的随机 ID
+      const bytes = new Uint8Array(16);
+      (window.crypto || window.msCrypto).getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     }
 
     function getOrCreateMobileDeviceId() {
@@ -730,6 +773,29 @@
       setTimeout(() => ui.toast.classList.remove('show'), 1800);
     }
 
+    // 替代原生 window.confirm 的自定义异步确认对话框
+    function customConfirm(message) {
+      return new Promise((resolve) => {
+        const overlay = document.getElementById('confirmOverlay');
+        const msg = document.getElementById('confirmMsg');
+        const okBtn = document.getElementById('confirmOkBtn');
+        const cancelBtn = document.getElementById('confirmCancelBtn');
+        if (!overlay) { resolve(window.confirm(message)); return; }
+        msg.textContent = message;
+        overlay.classList.add('show');
+        function cleanup(result) {
+          overlay.classList.remove('show');
+          okBtn.removeEventListener('click', onOk);
+          cancelBtn.removeEventListener('click', onCancel);
+          resolve(result);
+        }
+        function onOk() { cleanup(true); }
+        function onCancel() { cleanup(false); }
+        okBtn.addEventListener('click', onOk);
+        cancelBtn.addEventListener('click', onCancel);
+      });
+    }
+
     function setStatus(text, ok = false, err = false) {
       ui.status.textContent = text;
       ui.status.classList.toggle('ok', ok);
@@ -750,6 +816,11 @@
       const shouldOpen = typeof forceOpen === 'boolean' ? forceOpen : !ui.settingsModal.classList.contains('show');
       ui.settingsModal.classList.toggle('show', shouldOpen);
       if (ui.settingsBtn) ui.settingsBtn.textContent = shouldOpen ? '关闭设置' : '设置';
+      // 面板打开时才启动轮询，关闭时暂停，避免常驻 3 个请求/4s
+      if (state.role === 'desktop') {
+        if (shouldOpen) startPeerPolling();
+        else stopPeerPolling();
+      }
     }
 
     function createPeerItem(title, metaText, actionBuilder) {
@@ -862,12 +933,17 @@
       if (previous !== 'mobile' && !options.some((item) => item.value === previous)) {
         options.push({ value: previous, label: `${previous.slice(0, 8)}（离线）` });
       }
-      ui.sendTargetSelect.innerHTML = '';
-      for (const option of options) {
-        const el = document.createElement('option');
-        el.value = option.value;
-        el.textContent = option.label;
-        ui.sendTargetSelect.appendChild(el);
+      // 只在选项内容实际发生变化时才重建，避免打断用户正在进行的下拉操作
+      const existingValues = Array.from(ui.sendTargetSelect.options).map((o) => `${o.value}::${o.textContent}`).join('|');
+      const newValues = options.map((o) => `${o.value}::${o.label}`).join('|');
+      if (existingValues !== newValues) {
+        ui.sendTargetSelect.innerHTML = '';
+        for (const option of options) {
+          const el = document.createElement('option');
+          el.value = option.value;
+          el.textContent = option.label;
+          ui.sendTargetSelect.appendChild(el);
+        }
       }
       const exists = options.some((item) => item.value === previous);
       if (exists) {
@@ -968,7 +1044,7 @@
     async function removePairedPeer(deviceId, deviceName) {
       const id = String(deviceId || '').trim();
       if (!id) return;
-      if (!window.confirm(`确认删除与“${deviceName || id}”的配对关系吗？`)) return;
+      if (!await customConfirm(`确认删除与“${deviceName || id}”的配对关系吗？`)) return;
       try {
         const resp = await fetch(`/peers/paired/${encodeURIComponent(id)}`, {
           method: 'DELETE',
@@ -991,9 +1067,17 @@
       state.peerPollTimer = setInterval(() => refreshPeerState(true), 4000);
     }
 
+    function stopPeerPolling() {
+      if (state.peerPollTimer) {
+        clearInterval(state.peerPollTimer);
+        state.peerPollTimer = null;
+      }
+    }
+
     function createRecordNode(record) {
       const row = document.createElement('div');
       row.className = `row ${record.source === 'desktop' ? 'desktop' : 'mobile'}`;
+      row.dataset.recordId = record.id;
 
       const bubble = document.createElement('div');
       bubble.className = 'bubble';
@@ -1038,17 +1122,19 @@
     }
 
     function renderRecords() {
+      // 全量重建：仅在初始加载或批量重置时调用，使用 DocumentFragment 减少回流
       ui.records.innerHTML = '';
       if (state.records.length === 0) {
         ui.records.appendChild(ui.empty);
         ui.empty.style.display = 'block';
         return;
       }
-
       ui.empty.style.display = 'none';
+      const frag = document.createDocumentFragment();
       for (const record of state.records) {
-        ui.records.appendChild(createRecordNode(record));
+        frag.appendChild(createRecordNode(record));
       }
+      ui.records.appendChild(frag);
       ui.records.scrollTop = ui.records.scrollHeight;
     }
 
@@ -1056,13 +1142,15 @@
       if (state.recordIdSet.has(record.id)) return;
       state.recordIdSet.add(record.id);
       state.records.push(record);
-      renderRecords();
-
-      if (!notify) return;
-
-      if (state.role === 'mobile' && record.source === 'desktop') {
-        showToast(`收到文件：${record.name}`);
-        notifyInBackground(record);
+      if (notify) {
+        // 增量追加节点，避免全量重建列表
+        ui.empty.style.display = 'none';
+        ui.records.appendChild(createRecordNode(record));
+        ui.records.scrollTop = ui.records.scrollHeight;
+        if (state.role === 'mobile' && record.source === 'desktop') {
+          showToast(`收到文件：${record.name}`);
+          notifyInBackground(record);
+        }
       }
     }
 
@@ -1070,7 +1158,13 @@
       if (!state.recordIdSet.has(recordId)) return;
       state.recordIdSet.delete(recordId);
       state.records = state.records.filter((item) => item.id !== recordId);
-      renderRecords();
+      // 只移除对应节点，无需重建整个列表
+      const node = ui.records.querySelector(`[data-record-id="${CSS.escape(recordId)}"]`);
+      if (node) node.remove();
+      if (state.records.length === 0) {
+        ui.records.appendChild(ui.empty);
+        ui.empty.style.display = 'block';
+      }
     }
 
     async function triggerDownload(record) {
@@ -1219,7 +1313,8 @@
       job.percent = safeTotal > 0 ? Math.min(100, (job.loaded / safeTotal) * 100) : 0;
       job.speedBps = Number.isFinite(blendedBps) ? Math.max(0, blendedBps) : Math.max(0, Number(job.speedBps) || 0);
       job.lastTickAt = now;
-      renderUploadJobs();
+      // 使用 rAF 节流，避免高频进度事件导致每帧多次重建 DOM
+      scheduleRenderUploadJobs();
     }
 
     function removeTransferJob(jobId) {
@@ -1374,63 +1469,131 @@
       });
     }
 
+    // 上传任务节点缓存，避免每次进度更新全量重建 DOM
+    const _uploadJobNodes = new Map();
+    let _uploadJobsRafPending = false;
+
+    function scheduleRenderUploadJobs() {
+      if (_uploadJobsRafPending) return;
+      _uploadJobsRafPending = true;
+      requestAnimationFrame(() => {
+        _uploadJobsRafPending = false;
+        renderUploadJobs();
+      });
+    }
+
+    function _buildJobClassName(job) {
+      return ['upload-job', job.status === 'done' ? 'done' : '', job.status === 'fail' ? 'fail' : '', job.status === 'canceled' ? 'canceled' : ''].filter(Boolean).join(' ');
+    }
+
+    function _buildJobMetaText(job) {
+      const actionText = job.kind === 'download' ? '下载' : '上传';
+      const speedText = job.status === 'done'
+        ? `平均${actionText}速度 ${fmtSpeed(job.speedBps)}`
+        : `${actionText}速度 ${fmtSpeed(job.speedBps)}`;
+      return `${fmtSize(job.loaded)} / ${fmtSize(job.size)} · ${formatPercent(job.percent)} · ${speedText}`;
+    }
+
+    function _buildJobFillPercent(job) {
+      const isActive = job.status === 'uploading' || job.status === 'downloading';
+      const shownPercent = isActive ? Math.max(2, job.percent) : job.percent;
+      return Math.max(0, Math.min(100, shownPercent));
+    }
+
+    function _buildCancelBtn(job) {
+      if (!(job.kind === 'download' && job.cancelable && isTransferActive(job))) return null;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'job-cancel-btn';
+      btn.textContent = '×';
+      btn.setAttribute('aria-label', '取消');
+      btn.addEventListener('click', () => cancelTransfer(job.id));
+      return btn;
+    }
+
+    function _buildJobNode(job) {
+      const node = document.createElement('div');
+      node.dataset.jobId = job.id;
+      node.className = _buildJobClassName(job);
+
+      const head = document.createElement('div');
+      head.className = 'upload-head';
+      const name = document.createElement('span');
+      name.className = 'upload-name';
+      name.textContent = job.name;
+      const status = document.createElement('span');
+      status.className = 'upload-status';
+      status.textContent = transferStatusLabel(job);
+      head.appendChild(name);
+      head.appendChild(status);
+
+      const cancelBtn = _buildCancelBtn(job);
+      if (cancelBtn) node.appendChild(cancelBtn);
+
+      const meta = document.createElement('div');
+      meta.className = 'upload-meta';
+      meta.textContent = _buildJobMetaText(job);
+
+      const track = document.createElement('div');
+      track.className = 'progress-track';
+      const fill = document.createElement('div');
+      fill.className = 'progress-fill';
+      fill.style.width = `${_buildJobFillPercent(job)}%`;
+      track.appendChild(fill);
+
+      node.appendChild(head);
+      node.appendChild(meta);
+      node.appendChild(track);
+      return node;
+    }
+
+    function _updateJobNodeInPlace(node, job) {
+      node.className = _buildJobClassName(job);
+      const statusEl = node.querySelector('.upload-status');
+      if (statusEl) statusEl.textContent = transferStatusLabel(job);
+      const metaEl = node.querySelector('.upload-meta');
+      if (metaEl) metaEl.textContent = _buildJobMetaText(job);
+      const fillEl = node.querySelector('.progress-fill');
+      if (fillEl) fillEl.style.width = `${_buildJobFillPercent(job)}%`;
+      // 同步取消按鈕显隐
+      const existingCancel = node.querySelector('.job-cancel-btn');
+      const shouldShow = job.kind === 'download' && job.cancelable && isTransferActive(job);
+      if (shouldShow && !existingCancel) {
+        const btn = _buildCancelBtn(job);
+        if (btn) node.insertBefore(btn, node.querySelector('.upload-head'));
+      } else if (!shouldShow && existingCancel) {
+        existingCancel.remove();
+      }
+    }
+
     function renderUploadJobs() {
-      ui.uploadJobs.innerHTML = '';
       if (!state.uploadJobs.length) {
         ui.uploadJobs.classList.remove('show');
+        _uploadJobNodes.forEach((node) => { if (node.parentNode) node.remove(); });
+        _uploadJobNodes.clear();
         return;
       }
       ui.uploadJobs.classList.add('show');
 
-      for (const job of state.uploadJobs) {
-        const node = document.createElement('div');
-        node.className = `upload-job ${job.status === 'done' ? 'done' : ''} ${job.status === 'fail' ? 'fail' : ''} ${job.status === 'canceled' ? 'canceled' : ''}`.trim();
-
-        const head = document.createElement('div');
-        head.className = 'upload-head';
-
-        const name = document.createElement('span');
-        name.className = 'upload-name';
-        name.textContent = job.name;
-
-        const status = document.createElement('span');
-        status.className = 'upload-status';
-        status.textContent = transferStatusLabel(job);
-
-        head.appendChild(name);
-        head.appendChild(status);
-        if (job.kind === 'download' && job.cancelable && isTransferActive(job)) {
-          const cancelBtn = document.createElement('button');
-          cancelBtn.type = 'button';
-          cancelBtn.className = 'job-cancel-btn';
-          cancelBtn.textContent = '×';
-          cancelBtn.setAttribute('aria-label', '取消');
-          cancelBtn.addEventListener('click', () => cancelTransfer(job.id));
-          node.appendChild(cancelBtn);
+      // 移除已删除的任务对应节点
+      const currentIds = new Set(state.uploadJobs.map((j) => j.id));
+      _uploadJobNodes.forEach((node, id) => {
+        if (!currentIds.has(id)) {
+          if (node.parentNode) node.remove();
+          _uploadJobNodes.delete(id);
         }
+      });
 
-        const meta = document.createElement('div');
-        meta.className = 'upload-meta';
-        const actionText = job.kind === 'download' ? '下载' : '上传';
-        const speedText = job.status === 'done'
-          ? `平均${actionText}速度 ${fmtSpeed(job.speedBps)}`
-          : `${actionText}速度 ${fmtSpeed(job.speedBps)}`;
-        meta.textContent = `${fmtSize(job.loaded)} / ${fmtSize(job.size)} · ${formatPercent(job.percent)} · ${speedText}`;
-
-        const track = document.createElement('div');
-        track.className = 'progress-track';
-
-        const fill = document.createElement('div');
-        fill.className = 'progress-fill';
-        const isActive = job.status === 'uploading' || job.status === 'downloading';
-        const shownPercent = isActive ? Math.max(2, job.percent) : job.percent;
-        fill.style.width = `${Math.max(0, Math.min(100, shownPercent))}%`;
-
-        track.appendChild(fill);
-        node.appendChild(head);
-        node.appendChild(meta);
-        node.appendChild(track);
-        ui.uploadJobs.appendChild(node);
+      // 原地更新已有节点，新增任务创建节点
+      for (const job of state.uploadJobs) {
+        const existing = _uploadJobNodes.get(job.id);
+        if (existing) {
+          _updateJobNodeInPlace(existing, job);
+        } else {
+          const node = _buildJobNode(job);
+          _uploadJobNodes.set(job.id, node);
+          ui.uploadJobs.appendChild(node);
+        }
       }
     }
 
@@ -1679,7 +1842,8 @@
 
     function resetHeartbeat() {
       if (state.hbTimer) clearInterval(state.hbTimer);
-      const interval = document.hidden ? 7000 : 20000;
+      // 页面隐藏时降低心跳频率，避免浪费后台网络资源
+      const interval = document.hidden ? 60000 : 20000;
       state.hbTimer = setInterval(() => {
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
           state.ws.send(JSON.stringify({ type: 'ping', ts: Date.now(), hidden: document.hidden }));
@@ -2030,7 +2194,8 @@
           }
           uploadFiles(files, 'desktop');
         });
-        startPeerPolling();
+        // 初始化时静默刷新一次以填充发送目标下拉框状态，实际轮询在设置面板打开时才启动
+        refreshPeerState(true);
       } else {
         ui.limitRow.style.display = 'none';
         ui.downloadDirRow.style.display = 'none';
