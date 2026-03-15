@@ -164,6 +164,12 @@
 
     .row.mobile { justify-content: flex-end; }
     .row.desktop { justify-content: flex-start; }
+    .row.selectable { cursor: pointer; }
+    .row.selectable .bubble { transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+    .row.selectable.selected .bubble {
+      border-color: #1d4ed8;
+      box-shadow: 0 0 0 2px rgba(29, 78, 216, 0.15);
+    }
 
     .bubble {
       max-width: 90%;
@@ -287,6 +293,31 @@
       font-size: 12px;
       background: #f5f9ff;
       display: none;
+    }
+
+    .selection-bar {
+      margin: 0 14px 10px;
+      border: 1px solid #d8e3ef;
+      border-radius: 12px;
+      background: #f8fbff;
+      padding: 10px;
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .selection-bar.show { display: flex; }
+
+    .selection-summary {
+      font-size: 12px;
+      color: #33485a;
+    }
+
+    .selection-actions {
+      display: flex;
+      gap: 8px;
     }
 
     .drop-zone.active {
@@ -587,6 +618,14 @@
       <div class="empty" id="empty">暂无传输记录</div>
     </div>
 
+    <div class="selection-bar" id="recordSelectionBar">
+      <div class="selection-summary" id="recordSelectionSummary">已选择 0 条记录</div>
+      <div class="selection-actions">
+        <button class="btn danger" id="deleteSelectedRecordsBtn" type="button">删除选中</button>
+        <button class="btn" id="cancelDeleteModeBtn" type="button">取消</button>
+      </div>
+    </div>
+
     <div class="drop-zone" id="dropZone">拖拽文件到此区域，立即发送到手机</div>
 
     <div class="upload-jobs" id="uploadJobs"></div>
@@ -638,6 +677,10 @@
       <div class="setting-row" id="pairedDevicesRow">
         <span>已配对设备</span>
         <div class="peer-list" id="pairedDevices"></div>
+      </div>
+      <div class="setting-row" id="recordDeleteRow">
+        <span>传输记录</span>
+        <button class="btn danger" id="deleteRecordsBtn" type="button">删除记录</button>
       </div>
       <div class="setting-note" id="secureNote">默认下载目录为 Windows Downloads，上传上限默认 10GB；电脑互传可在上方设备列表发起并确认配对。</div>
     </div>
@@ -710,6 +753,9 @@
       pendingPairRequests: [],
       peerRefreshInFlight: false,
       peerPollTimer: null,
+      recordDeleteMode: false,
+      selectedRecordIds: new Set(),
+      recordDeleteInFlight: false,
       desktopTargetDeviceId: (() => {
         try {
           const saved = String(localStorage.getItem('lft_desktop_target') || '').trim();
@@ -760,6 +806,12 @@
       pairRequests: document.getElementById('pairRequests'),
       pairedDevicesRow: document.getElementById('pairedDevicesRow'),
       pairedDevices: document.getElementById('pairedDevices'),
+      recordDeleteRow: document.getElementById('recordDeleteRow'),
+      deleteRecordsBtn: document.getElementById('deleteRecordsBtn'),
+      recordSelectionBar: document.getElementById('recordSelectionBar'),
+      recordSelectionSummary: document.getElementById('recordSelectionSummary'),
+      deleteSelectedRecordsBtn: document.getElementById('deleteSelectedRecordsBtn'),
+      cancelDeleteModeBtn: document.getElementById('cancelDeleteModeBtn'),
       secureNote: document.getElementById('secureNote'),
     };
 
@@ -851,6 +903,15 @@
       ui.status.textContent = text;
       ui.status.classList.toggle('ok', ok);
       ui.status.classList.toggle('err', err);
+    }
+
+    function syncDesktopTipText() {
+      if (state.role !== 'desktop') return;
+      if (state.recordDeleteMode) {
+        ui.tip.textContent = '请选择要删除的历史记录，确认后仅删除记录，不删除实际文件。';
+        return;
+      }
+      ui.tip.textContent = '可点击“发送文件”（桌面模式将直接引用原文件，不再复制）；也可拖拽上传；右键记录可打开文件夹。';
     }
 
     function persistDesktopTarget(deviceId) {
@@ -1125,10 +1186,106 @@
       }
     }
 
+    function syncRecordSelectionBar() {
+      if (!ui.recordSelectionBar || !ui.recordSelectionSummary) return;
+      const selectedCount = state.selectedRecordIds.size;
+      ui.recordSelectionSummary.textContent = `已选择 ${selectedCount} 条记录`;
+      ui.recordSelectionBar.classList.toggle('show', state.role === 'desktop' && state.recordDeleteMode);
+      if (ui.deleteSelectedRecordsBtn) {
+        ui.deleteSelectedRecordsBtn.disabled = state.recordDeleteInFlight || selectedCount === 0;
+      }
+    }
+
+    function setRecordDeleteMode(enabled) {
+      if (state.role !== 'desktop') return;
+      const nextEnabled = !!enabled;
+      if (!nextEnabled) {
+        state.selectedRecordIds.clear();
+        state.recordDeleteInFlight = false;
+      }
+      if (state.recordDeleteMode !== nextEnabled) {
+        state.recordDeleteMode = nextEnabled;
+        renderRecords();
+      }
+      syncRecordSelectionBar();
+      syncDesktopTipText();
+    }
+
+    function toggleRecordSelection(recordId) {
+      if (!state.recordDeleteMode) return;
+      const id = String(recordId || '').trim();
+      if (!id || !state.recordIdSet.has(id)) return;
+      if (state.selectedRecordIds.has(id)) state.selectedRecordIds.delete(id);
+      else state.selectedRecordIds.add(id);
+      const node = ui.records.querySelector(`[data-record-id="${CSS.escape(id)}"]`);
+      if (node) node.classList.toggle('selected', state.selectedRecordIds.has(id));
+      syncRecordSelectionBar();
+    }
+
+    function beginDeleteRecordsFlow() {
+      if (state.role !== 'desktop') return;
+      if (!state.records.length) {
+        showToast('暂无可删除的历史记录');
+        return;
+      }
+      toggleSettingsPanel(false);
+      setRecordDeleteMode(true);
+      showToast('已进入删除模式，请选择记录');
+    }
+
+    async function deleteSelectedRecords() {
+      if (state.role !== 'desktop' || !state.recordDeleteMode || state.recordDeleteInFlight) return;
+      const ids = Array.from(state.selectedRecordIds);
+      if (!ids.length) {
+        showToast('请先选择要删除的记录');
+        return;
+      }
+      if (!await customConfirm(`确认删除选中的 ${ids.length} 条历史记录吗？此操作不会删除实际文件。`)) return;
+
+      state.recordDeleteInFlight = true;
+      syncRecordSelectionBar();
+      try {
+        const resp = await fetch('/records/delete', {
+          method: 'POST',
+          headers: {
+            ...authHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ ids }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `删除失败(${resp.status})`);
+        const deletedIds = Array.isArray(data.deleted_ids) ? data.deleted_ids : [];
+        const notFoundIds = Array.isArray(data.not_found_ids) ? data.not_found_ids : [];
+        for (const recordId of deletedIds) {
+          removeRecord(recordId);
+        }
+        if (!deletedIds.length) {
+          showToast('未找到可删除的记录');
+          return;
+        }
+        const suffix = notFoundIds.length ? `，${notFoundIds.length} 条已不存在` : '';
+        showToast(`已删除 ${deletedIds.length} 条记录${suffix}`);
+        setRecordDeleteMode(false);
+      } catch (err) {
+        console.error(err);
+        showToast('删除记录失败');
+      } finally {
+        state.recordDeleteInFlight = false;
+        syncRecordSelectionBar();
+      }
+    }
+
     function createRecordNode(record) {
       const row = document.createElement('div');
       row.className = `row ${record.source === 'desktop' ? 'desktop' : 'mobile'}`;
       row.dataset.recordId = record.id;
+      if (state.role === 'desktop' && state.recordDeleteMode) {
+        row.classList.add('selectable');
+        if (state.selectedRecordIds.has(record.id)) {
+          row.classList.add('selected');
+        }
+      }
 
       const bubble = document.createElement('div');
       bubble.className = 'bubble';
@@ -1136,7 +1293,7 @@
       const name = document.createElement('div');
       name.className = 'name';
       name.textContent = record.name;
-      if (state.role === 'desktop') {
+      if (state.role === 'desktop' && !state.recordDeleteMode) {
         name.classList.add('clickable');
         name.title = '左键打开文件';
         name.addEventListener('click', () => openRecordFile(record));
@@ -1152,7 +1309,7 @@
       const actions = document.createElement('div');
       actions.className = 'actions';
 
-      if (record.download_url) {
+      if (record.download_url && !state.recordDeleteMode) {
         const dlBtn = document.createElement('button');
         dlBtn.className = 'btn';
         dlBtn.textContent = '下载';
@@ -1161,9 +1318,13 @@
       }
       bubble.appendChild(name);
       bubble.appendChild(desc);
-      bubble.appendChild(actions);
+      if (actions.childElementCount > 0) {
+        bubble.appendChild(actions);
+      }
       row.appendChild(bubble);
-      if (state.role === 'desktop') {
+      if (state.role === 'desktop' && state.recordDeleteMode) {
+        row.addEventListener('click', () => toggleRecordSelection(record.id));
+      } else if (state.role === 'desktop') {
         row.addEventListener('contextmenu', (event) => {
           event.preventDefault();
           openRecordFolder(record);
@@ -1178,6 +1339,7 @@
       if (state.records.length === 0) {
         ui.records.appendChild(ui.empty);
         ui.empty.style.display = 'block';
+        syncRecordSelectionBar();
         return;
       }
       ui.empty.style.display = 'none';
@@ -1187,6 +1349,7 @@
       }
       ui.records.appendChild(frag);
       ui.records.scrollTop = ui.records.scrollHeight;
+      syncRecordSelectionBar();
     }
 
     function addRecord(record, notify = true) {
@@ -1203,12 +1366,14 @@
           notifyInBackground(record);
         }
       }
+      syncRecordSelectionBar();
     }
 
     function removeRecord(recordId) {
       if (!state.recordIdSet.has(recordId)) return;
       state.recordIdSet.delete(recordId);
       state.records = state.records.filter((item) => item.id !== recordId);
+      state.selectedRecordIds.delete(recordId);
       // 只移除对应节点，无需重建整个列表
       const node = ui.records.querySelector(`[data-record-id="${CSS.escape(recordId)}"]`);
       if (node) node.remove();
@@ -1216,6 +1381,7 @@
         ui.records.appendChild(ui.empty);
         ui.empty.style.display = 'block';
       }
+      syncRecordSelectionBar();
     }
 
     async function triggerDownload(record) {
@@ -1922,6 +2088,7 @@
         if (data.type === 'init' && Array.isArray(data.records)) {
           state.records = [];
           state.recordIdSet.clear();
+          state.selectedRecordIds.clear();
           for (const record of data.records) {
             addRecord(record, false);
           }
@@ -1931,6 +2098,12 @@
 
         if (data.type === 'new_record' && data.record) {
           addRecord(data.record, true);
+          return;
+        }
+
+        if (data.type === 'mobile_connected' && data.qr_payload) {
+          applyQrPayload(data.qr_payload);
+          showToast('手机已连接，二维码已刷新');
           return;
         }
 
@@ -1989,6 +2162,7 @@
         if (!Array.isArray(data.records)) return;
         state.records = [];
         state.recordIdSet.clear();
+        state.selectedRecordIds.clear();
         for (const record of data.records) {
           addRecord(record, false);
         }
@@ -2153,7 +2327,12 @@
         });
       }
       document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape') toggleSettingsPanel(false);
+        if (event.key !== 'Escape') return;
+        if (state.recordDeleteMode) {
+          setRecordDeleteMode(false);
+          return;
+        }
+        toggleSettingsPanel(false);
       });
       ui.sendBtn.addEventListener('click', () => {
         if (state.role === 'desktop') {
@@ -2193,10 +2372,20 @@
         ui.peerDiscoveryRow.style.display = 'flex';
         ui.pairRequestsRow.style.display = 'flex';
         ui.pairedDevicesRow.style.display = 'flex';
+        if (ui.recordDeleteRow) ui.recordDeleteRow.style.display = 'flex';
         ui.saveLimitBtn.addEventListener('click', () => saveUploadLimit());
         ui.pickDownloadDirBtn.addEventListener('click', () => pickDownloadDir());
         ui.saveDownloadDirBtn.addEventListener('click', () => saveDownloadDir());
         ui.openDownloadDirBtn.addEventListener('click', () => openDownloadDir());
+        if (ui.deleteRecordsBtn) {
+          ui.deleteRecordsBtn.addEventListener('click', () => beginDeleteRecordsFlow());
+        }
+        if (ui.deleteSelectedRecordsBtn) {
+          ui.deleteSelectedRecordsBtn.addEventListener('click', () => deleteSelectedRecords());
+        }
+        if (ui.cancelDeleteModeBtn) {
+          ui.cancelDeleteModeBtn.addEventListener('click', () => setRecordDeleteMode(false));
+        }
         if (ui.refreshPeersBtn) {
           ui.refreshPeersBtn.addEventListener('click', () => refreshPeerState(false));
         }
@@ -2231,7 +2420,8 @@
         }
 
         ui.dropZone.style.display = 'block';
-        ui.tip.textContent = '可点击“发送文件”（桌面模式将直接引用原文件，不再复制）；也可拖拽上传；右键记录可打开文件夹。';
+        syncDesktopTipText();
+        syncRecordSelectionBar();
 
         const enter = () => ui.dropZone.classList.add('active');
         const leave = () => ui.dropZone.classList.remove('active');
@@ -2267,6 +2457,7 @@
         ui.peerDiscoveryRow.style.display = 'none';
         ui.pairRequestsRow.style.display = 'none';
         ui.pairedDevicesRow.style.display = 'none';
+        if (ui.recordDeleteRow) ui.recordDeleteRow.style.display = 'none';
         ui.tip.textContent = '点击“发送文件”选择文件，或“拍照上传”直接拍照发送到电脑。';
       }
     }

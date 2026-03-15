@@ -1000,6 +1000,27 @@ def create_app(
         except Exception:
             pass
 
+    def remove_record_cache_only(transfer_id: str) -> None:
+        with lock:
+            if transfer_id in record_map:
+                record_map.pop(transfer_id, None)
+            records[:] = [r for r in records if r["id"] != transfer_id]
+
+    def normalize_history_ids(raw_ids: object) -> list[str]:
+        if not isinstance(raw_ids, list):
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in raw_ids:
+            value = str(item or "").strip()
+            if not value or len(value) > 80:
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
     def persist_runtime_setting(key: str, value) -> None:
         try:
             settings = load_runtime_settings()
@@ -1189,6 +1210,7 @@ def create_app(
         token = request.args.get("token", "")
         session_id = read_session_id()
         valid_session = get_valid_session(session_id, ip)
+        consumed_token = False
 
         if token:
             if valid_session is not None:
@@ -1209,6 +1231,7 @@ def create_app(
                         ),
                         403,
                     )
+                consumed_token = True
 
             response = make_response(
                 render_template(
@@ -1223,6 +1246,13 @@ def create_app(
                 )
             )
             response.set_cookie("lft_session", active_session_id, httponly=True, samesite="Lax")
+            if consumed_token:
+                notify_desktop_clients(
+                    {
+                        "type": "mobile_connected",
+                        "qr_payload": get_mobile_qr_payload(force_new=True),
+                    }
+                )
             return response
 
         if role == "mobile":
@@ -1298,6 +1328,46 @@ def create_app(
         rows = history_rows(include_all=include_all, device_id=filter_device_id)
         data = [public_history_record(row, include_file_path=include_file_path) for row in rows]
         return jsonify({"records": data})
+
+    @app.post("/records/delete")
+    def delete_records():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可删除历史记录"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        history_ids = normalize_history_ids(payload.get("ids"))
+        if not history_ids:
+            return jsonify({"error": "请至少选择一条记录"}), 400
+        if len(history_ids) > 500:
+            return jsonify({"error": "单次最多删除 500 条记录"}), 400
+
+        placeholders = ",".join("?" for _ in history_ids)
+        with history_connection() as conn:
+            cursor = conn.execute(
+                f"SELECT id FROM transfer_history WHERE id IN ({placeholders})",
+                tuple(history_ids),
+            )
+            existing_ids = [str(row["id"]) for row in cursor.fetchall()]
+            if existing_ids:
+                delete_placeholders = ",".join("?" for _ in existing_ids)
+                conn.execute(
+                    f"DELETE FROM transfer_history WHERE id IN ({delete_placeholders})",
+                    tuple(existing_ids),
+                )
+
+        existing_set = set(existing_ids)
+        not_found_ids = [item for item in history_ids if item not in existing_set]
+        for history_id in existing_ids:
+            remove_record_cache_only(history_id)
+            broadcast({"type": "remove_record", "id": history_id})
+
+        return jsonify(
+            {
+                "ok": True,
+                "deleted_ids": existing_ids,
+                "not_found_ids": not_found_ids,
+            }
+        )
 
     @app.get("/settings")
     def get_settings():
