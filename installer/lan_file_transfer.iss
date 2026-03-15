@@ -2,7 +2,7 @@
   #define MyAppName "LAN File Transfer"
 #endif
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.8.0"
 #endif
 #ifndef MyAppPublisher
   #define MyAppPublisher "FunctionHookTJU"

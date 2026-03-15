@@ -231,6 +231,17 @@
       font-weight: 600;
     }
 
+    .btn.camera {
+      border-color: #0284c7;
+      background: #0284c7;
+      color: #fff;
+      min-width: 130px;
+      height: 40px;
+      border-radius: 999px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
     .bottom {
       border-top: 1px solid var(--line);
       padding: 10px 14px;
@@ -240,6 +251,13 @@
       background: #fbfdff;
     }
 
+    .bottom-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
     .tip {
       color: var(--muted);
       font-size: 12px;
@@ -247,7 +265,7 @@
       flex: 1;
     }
 
-    #fileInput { display: none; }
+    #fileInput, #cameraInput { display: none; }
 
     .drop-zone {
       margin: 0 14px 10px;
@@ -511,6 +529,23 @@
       gap: 8px;
     }
 
+    @media (max-width: 640px) {
+      .bottom {
+        align-items: stretch;
+        flex-wrap: wrap;
+      }
+      .tip {
+        flex-basis: 100%;
+      }
+      .bottom-actions {
+        width: 100%;
+      }
+      .btn.send,
+      .btn.camera {
+        flex: 1;
+      }
+    }
+
   </style>
 </head>
 <body>
@@ -548,8 +583,12 @@
 
     <div class="bottom">
       <div class="tip" id="tip"></div>
-      <button class="btn send" id="sendBtn">发送文件</button>
+      <div class="bottom-actions">
+        <button class="btn send" id="sendBtn" type="button">发送文件</button>
+        <button class="btn camera" id="cameraBtn" type="button">拍照上传</button>
+      </div>
       <input id="fileInput" type="file" multiple />
+      <input id="cameraInput" type="file" accept="image/*" capture="environment" />
     </div>
   </div>
 
@@ -675,7 +714,9 @@
       records: document.getElementById('records'),
       empty: document.getElementById('empty'),
       sendBtn: document.getElementById('sendBtn'),
+      cameraBtn: document.getElementById('cameraBtn'),
       fileInput: document.getElementById('fileInput'),
+      cameraInput: document.getElementById('cameraInput'),
       status: document.getElementById('status'),
       meta: document.getElementById('meta'),
       tip: document.getElementById('tip'),
@@ -2116,6 +2157,17 @@
         if (files.length) uploadFiles(files, state.role);
         e.target.value = '';
       });
+      if (ui.cameraBtn && ui.cameraInput) {
+        ui.cameraBtn.addEventListener('click', () => {
+          if (state.role !== 'mobile') return;
+          ui.cameraInput.click();
+        });
+        ui.cameraInput.addEventListener('change', (e) => {
+          const files = Array.from(e.target.files || []);
+          if (files.length) uploadFiles(files, 'mobile');
+          e.target.value = '';
+        });
+      }
       document.addEventListener('visibilitychange', async () => {
         resetHeartbeat();
         if (document.hidden && 'Notification' in window && Notification.permission === 'default') {
@@ -2124,6 +2176,7 @@
       });
 
       if (state.role === 'desktop') {
+        if (ui.cameraBtn) ui.cameraBtn.style.display = 'none';
         ui.limitRow.style.display = 'flex';
         ui.downloadDirRow.style.display = 'flex';
         ui.sendTargetRow.style.display = 'flex';
@@ -2197,13 +2250,14 @@
         // 初始化时静默刷新一次以填充发送目标下拉框状态，实际轮询在设置面板打开时才启动
         refreshPeerState(true);
       } else {
+        if (ui.cameraBtn) ui.cameraBtn.style.display = 'inline-flex';
         ui.limitRow.style.display = 'none';
         ui.downloadDirRow.style.display = 'none';
         ui.sendTargetRow.style.display = 'none';
         ui.peerDiscoveryRow.style.display = 'none';
         ui.pairRequestsRow.style.display = 'none';
         ui.pairedDevicesRow.style.display = 'none';
-        ui.tip.textContent = '点击“发送文件”上传到电脑。';
+        ui.tip.textContent = '点击“发送文件”选择文件，或“拍照上传”直接拍照发送到电脑。';
       }
     }
 
@@ -2216,6 +2270,10 @@
         ui.tip.textContent = serverConfig.accessDeniedReason || '当前访问未授权，请重新扫码。';
         ui.sendBtn.disabled = true;
         ui.sendBtn.style.opacity = '0.5';
+        if (ui.cameraBtn) {
+          ui.cameraBtn.disabled = true;
+          ui.cameraBtn.style.opacity = '0.5';
+        }
         ui.settingsBtn.disabled = true;
         ui.settingsPanel.style.opacity = '0.55';
         ui.settingsPanel.style.pointerEvents = 'none';

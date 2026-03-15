@@ -1,6 +1,6 @@
 param(
     [string]$IsccPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-    [string]$Version = "1.0.0"
+    [string]$Version = "1.8.0"
 )
 
 $ErrorActionPreference = "Stop"
