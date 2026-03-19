@@ -1309,7 +1309,15 @@
       const actions = document.createElement('div');
       actions.className = 'actions';
 
-      if (record.download_url && !state.recordDeleteMode) {
+      const recordStatus = String(record.status || '').trim();
+      const canOpenDownloadedFile = state.role === 'desktop' && (recordStatus === '已下载' || recordStatus === '已保存');
+      if (canOpenDownloadedFile && !state.recordDeleteMode) {
+        const openBtn = document.createElement('button');
+        openBtn.className = 'btn';
+        openBtn.textContent = '打开';
+        openBtn.addEventListener('click', () => openRecordFile(record));
+        actions.appendChild(openBtn);
+      } else if (record.download_url && !state.recordDeleteMode) {
         const dlBtn = document.createElement('button');
         dlBtn.className = 'btn';
         dlBtn.textContent = '下载';
@@ -1369,6 +1377,25 @@
       syncRecordSelectionBar();
     }
 
+    function updateRecord(record) {
+      const id = String(record?.id || '').trim();
+      if (!id) return;
+      const idx = state.records.findIndex((item) => item.id === id);
+      if (idx < 0) {
+        addRecord(record, false);
+        renderRecords();
+        return;
+      }
+      const next = { ...state.records[idx], ...record };
+      state.records[idx] = next;
+      const oldNode = ui.records.querySelector(`[data-record-id="${CSS.escape(id)}"]`);
+      if (oldNode) {
+        oldNode.replaceWith(createRecordNode(next));
+      } else {
+        renderRecords();
+      }
+    }
+
     function removeRecord(recordId) {
       if (!state.recordIdSet.has(recordId)) return;
       state.recordIdSet.delete(recordId);
@@ -1393,8 +1420,11 @@
         }
 
         const data = await saveFileToDesktopWithSpeed(record);
+        if (data && data.record) {
+          updateRecord(data.record);
+        }
         const savedName = data.file_name || record.name;
-        showToast(`已保存：${savedName}`);
+        showToast(`已下载：${savedName}`);
       } catch (err) {
         if (isCancelError(err)) {
           showToast('已取消下载');
@@ -2101,6 +2131,11 @@
           return;
         }
 
+        if (data.type === 'record_updated' && data.record) {
+          updateRecord(data.record);
+          return;
+        }
+
         if (data.type === 'mobile_connected' && data.qr_payload) {
           applyQrPayload(data.qr_payload);
           showToast('手机已连接，二维码已刷新');
@@ -2493,3 +2528,4 @@
   </script>
 </body>
 </html>
+

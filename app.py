@@ -25,7 +25,6 @@ from flask import Flask, jsonify, make_response, render_template, request, send_
 from flask_sock import Sock
 from qrcode import QRCode
 import requests
-from werkzeug.utils import secure_filename
 
 APP_NAME = "LANFileTransfer"
 DESKTOP_DEVICE_ID = "desktop"
@@ -130,6 +129,23 @@ def default_transient_dir() -> Path:
 
 def default_download_dir() -> Path:
     if sys.platform.startswith("win"):
+        try:
+            import winreg
+
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            downloads_key = "{374DE290-123F-4565-9164-39C4925E467B}"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                raw_value, _ = winreg.QueryValueEx(key, downloads_key)
+            if isinstance(raw_value, bytes):
+                raw_text = raw_value.decode("utf-16-le", errors="ignore").rstrip("\x00")
+            else:
+                raw_text = str(raw_value)
+            expanded = os.path.expandvars(raw_text.strip())
+            if expanded:
+                return Path(expanded).expanduser().resolve()
+        except Exception:
+            pass
+
         user_profile = os.getenv("USERPROFILE")
         if user_profile:
             return (Path(user_profile) / "Downloads").resolve()
@@ -162,10 +178,20 @@ def save_runtime_settings(settings: dict) -> None:
 def normalize_download_dir(raw_dir: str) -> Optional[Path]:
     if not raw_dir:
         return None
-    candidate = Path(raw_dir.strip()).expanduser()
+    normalized_text = os.path.expandvars(raw_dir.strip().strip("'\""))
+    candidate = Path(normalized_text).expanduser()
     if not candidate.is_absolute():
         return None
     return candidate.resolve()
+
+
+def normalize_uploaded_filename(raw_name: str) -> str:
+    raw_text = str(raw_name or "").strip().strip("'\"")
+    if not raw_text:
+        return "downloaded_file"
+    flattened = raw_text.replace("\\", "/")
+    base_name = flattened.rsplit("/", 1)[-1].strip()
+    return base_name or "downloaded_file"
 
 
 def sanitize_filename_for_windows(name: str) -> str:
@@ -926,6 +952,33 @@ def create_app(
         with history_connection() as conn:
             conn.execute("UPDATE transfer_history SET status = ? WHERE id = ?", (status, history_id))
 
+    def update_history_record(
+        history_id: str,
+        *,
+        status: Optional[str] = None,
+        file_name: Optional[str] = None,
+        file_path: Optional[str] = None,
+    ) -> None:
+        updates = []
+        params = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if file_name is not None:
+            updates.append("file_name = ?")
+            params.append(file_name)
+        if file_path is not None:
+            updates.append("file_path = ?")
+            params.append(file_path)
+        if not updates:
+            return
+        params.append(history_id)
+        with history_connection() as conn:
+            conn.execute(
+                f"UPDATE transfer_history SET {', '.join(updates)} WHERE id = ?",
+                tuple(params),
+            )
+
     def history_rows(include_all: bool, device_id: Optional[str]) -> list[sqlite3.Row]:
         with history_connection() as conn:
             if include_all:
@@ -984,6 +1037,12 @@ def create_app(
         if row is None:
             return
         broadcast({"type": "new_record", "record": public_history_record(row)}, target_device_id=target_device_id)
+
+    def send_history_update_event(history_id: str, target_device_id: str) -> None:
+        row = history_row_by_id(history_id)
+        if row is None:
+            return
+        broadcast({"type": "record_updated", "record": public_history_record(row)}, target_device_id=target_device_id)
 
     def remove_record_and_file(transfer_id: str) -> None:
         removed = None
@@ -1849,7 +1908,7 @@ def create_app(
         if uploaded is None or uploaded.filename == "":
             return jsonify({"error": "缺少文件"}), 400
 
-        original_name = uploaded.filename.strip()
+        original_name = normalize_uploaded_filename(uploaded.filename)
         target_dir = Path(app.config["DOWNLOAD_DIR"]).resolve()
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -2037,11 +2096,11 @@ def create_app(
         if uploaded is None or uploaded.filename == "":
             return jsonify({"error": "缺少文件"}), 400
 
-        original_name = uploaded.filename.strip()
+        original_name = normalize_uploaded_filename(uploaded.filename)
         transfer_id = uuid.uuid4().hex
         is_transient = source == "desktop"
         if is_transient:
-            safe_name = secure_filename(original_name) or f"file-{int(time.time())}"
+            safe_name = sanitize_filename_for_windows(original_name)
             saved_name = f"{int(time.time())}_{transfer_id}_{safe_name}"
             target_dir = app.config["TRANSIENT_UPLOAD_DIR"]
             destination = target_dir / saved_name
@@ -2166,22 +2225,13 @@ def create_app(
                 return jsonify({"error": "无权访问该文件"}), 403
         else:
             req_device_id = DESKTOP_DEVICE_ID
-            req_device_name = "电脑端"
 
         try:
             update_history_status(transfer_id, "已下载")
-            download_history_id = uuid.uuid4().hex
-            insert_history_record(
-                history_id=download_history_id,
-                device_id=req_device_id,
-                device_name=req_device_name,
-                file_name=record["name"],
-                file_path=str(record["path"]),
-                direction="下载",
-                status="成功",
-                file_size=int(record["size"]),
-                source="desktop" if is_trusted_desktop(request.remote_addr) else "mobile",
-            )
+            with lock:
+                active = record_map.get(transfer_id)
+                if active is not None:
+                    active["status"] = "已下载"
         except Exception as exc:
             return jsonify({"error": f"写入历史记录失败: {exc}"}), 500
 
@@ -2191,7 +2241,7 @@ def create_app(
             download_name=record["name"],
             conditional=True,
         )
-        send_history_event(download_history_id, target_device_id=req_device_id)
+        send_history_update_event(transfer_id, target_device_id=req_device_id)
         return response
 
     @app.post("/files/<transfer_id>/save")
@@ -2208,6 +2258,10 @@ def create_app(
         source_path = record.get("path")
         if not isinstance(source_path, Path) or not source_path.exists():
             return jsonify({"error": "源文件不可用"}), 404
+        try:
+            source_resolved = source_path.resolve()
+        except Exception as exc:
+            return jsonify({"error": f"源文件路径不可用: {exc}"}), 500
         if not is_trusted_desktop(request.remote_addr):
             try:
                 req_device_id, _req_device_name, _ = resolve_request_device()
@@ -2215,40 +2269,58 @@ def create_app(
                 return jsonify({"error": str(exc)}), 400
             if record.get("device_id") != req_device_id:
                 return jsonify({"error": "无权保存该文件"}), 403
+        else:
+            req_device_id = DESKTOP_DEVICE_ID
 
         download_dir_local = Path(app.config["DOWNLOAD_DIR"]).resolve()
+        source_parent_matches_download_dir = False
         try:
             download_dir_local.mkdir(parents=True, exist_ok=True)
-            source_resolved = source_path.resolve()
-            if source_resolved.parent == download_dir_local:
+            source_parent_matches_download_dir = source_resolved.parent == download_dir_local
+            if source_parent_matches_download_dir:
                 target_path = source_resolved
             else:
                 target_path = allocate_unique_file_path(download_dir_local, record["name"])
                 shutil.copy2(source_path, target_path)
+            target_resolved = target_path.resolve()
         except Exception as exc:
             return jsonify({"error": f"保存失败: {exc}"}), 500
 
         try:
-            update_history_status(transfer_id, "已保存")
-            saved_history_id = uuid.uuid4().hex
-            insert_history_record(
-                history_id=saved_history_id,
-                device_id=DESKTOP_DEVICE_ID,
-                device_name="电脑端",
+            update_history_record(
+                transfer_id,
+                status="已下载",
                 file_name=target_path.name,
                 file_path=str(target_path),
-                direction="下载",
-                status="成功",
-                file_size=int(record["size"]),
-                source="desktop",
             )
+            with lock:
+                active = record_map.get(transfer_id)
+                if active is not None:
+                    active["status"] = "已下载"
+                    active["name"] = target_path.name
+                    active["path"] = target_path
         except Exception as exc:
             return jsonify({"error": f"写入历史记录失败: {exc}"}), 500
 
         if record.get("transient"):
-            remove_record_and_file(transfer_id)
+            remove_record_cache_only(transfer_id)
+            if source_resolved != target_resolved:
+                try:
+                    if source_resolved.exists():
+                        source_resolved.unlink(missing_ok=True)
+                except Exception as exc:
+                    app.logger.warning(
+                        "transient cleanup failed transfer_id=%s source=%s target=%s error=%s",
+                        transfer_id,
+                        source_resolved,
+                        target_resolved,
+                        exc,
+                    )
 
-        send_history_event(saved_history_id, target_device_id=DESKTOP_DEVICE_ID)
+        send_history_update_event(transfer_id, target_device_id=req_device_id)
+        row = history_row_by_id(transfer_id)
+        if row is None:
+            return jsonify({"error": "历史记录不存在"}), 500
 
         return jsonify(
             {
@@ -2256,6 +2328,10 @@ def create_app(
                 "saved_path": str(target_path),
                 "file_name": target_path.name,
                 "download_dir": str(download_dir_local),
+                "record": public_history_record(
+                    row,
+                    include_file_path=is_trusted_desktop(request.remote_addr),
+                ),
             }
         )
 
