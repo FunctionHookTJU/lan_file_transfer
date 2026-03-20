@@ -373,10 +373,17 @@ def create_app(
                     timestamp TEXT NOT NULL,
                     status TEXT NOT NULL,
                     file_size INTEGER NOT NULL DEFAULT 0,
-                    source TEXT NOT NULL DEFAULT 'mobile'
+                    source TEXT NOT NULL DEFAULT 'mobile',
+                    desktop_side TEXT NOT NULL DEFAULT 'unknown'
                 )
                 """
             )
+            cursor = conn.execute("PRAGMA table_info(transfer_history)")
+            columns = {str(row["name"]) for row in cursor.fetchall()}
+            if "desktop_side" not in columns:
+                conn.execute(
+                    "ALTER TABLE transfer_history ADD COLUMN desktop_side TEXT NOT NULL DEFAULT 'unknown'"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_transfer_history_device_ts ON transfer_history(device_id, timestamp)"
             )
@@ -386,6 +393,12 @@ def create_app(
 
     def normalize_device_id(raw: Optional[str]) -> str:
         return normalize_device_identifier(raw)
+
+    def normalize_desktop_side(raw: Optional[str]) -> str:
+        side = str(raw or "").strip().lower()
+        if side in ("incoming", "outgoing"):
+            return side
+        return "unknown"
 
     def resolve_request_device(allow_query: bool = False) -> tuple[str, str, bool]:
         ip = request.remote_addr
@@ -902,6 +915,7 @@ def create_app(
                 status="成功",
                 file_size=max(0, int(file_size or 0)),
                 source="desktop",
+                desktop_side="outgoing",
                 timestamp_text=created_at_text,
             )
         except Exception as exc:
@@ -924,6 +938,7 @@ def create_app(
         status: str,
         file_size: int,
         source: str,
+        desktop_side: str,
         timestamp_text: Optional[str] = None,
     ) -> None:
         ts = timestamp_text or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -931,8 +946,8 @@ def create_app(
             conn.execute(
                 """
                 INSERT INTO transfer_history
-                (id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source, desktop_side)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     history_id,
@@ -945,6 +960,7 @@ def create_app(
                     status,
                     max(0, int(file_size or 0)),
                     source if source in ("desktop", "mobile") else "mobile",
+                    normalize_desktop_side(desktop_side),
                 ),
             )
 
@@ -984,7 +1000,7 @@ def create_app(
             if include_all:
                 cursor = conn.execute(
                     """
-                    SELECT id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source
+                    SELECT id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source, desktop_side
                     FROM transfer_history
                     ORDER BY timestamp ASC, id ASC
                     """
@@ -992,7 +1008,7 @@ def create_app(
             else:
                 cursor = conn.execute(
                     """
-                    SELECT id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source
+                    SELECT id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source, desktop_side
                     FROM transfer_history
                     WHERE device_id = ?
                     ORDER BY timestamp ASC, id ASC
@@ -1005,7 +1021,7 @@ def create_app(
         with history_connection() as conn:
             cursor = conn.execute(
                 """
-                SELECT id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source
+                SELECT id, device_id, device_name, file_name, file_path, direction, timestamp, status, file_size, source, desktop_side
                 FROM transfer_history
                 WHERE id = ?
                 LIMIT 1
@@ -1028,6 +1044,7 @@ def create_app(
             "status": str(row["status"]),
             "size": int(row["file_size"] or 0),
             "source": str(row["source"] or "mobile"),
+            "desktop_side": normalize_desktop_side(row["desktop_side"]),
             "created_at": str(row["timestamp"]),
             "download_url": f"/files/{history_id}" if active is not None else "",
         }
@@ -1961,6 +1978,7 @@ def create_app(
                 status="成功",
                 file_size=size,
                 source="desktop",
+                desktop_side="incoming",
                 timestamp_text=created_at_text,
             )
         except Exception as exc:
@@ -2060,6 +2078,7 @@ def create_app(
                 status="成功",
                 file_size=file_size,
                 source="desktop",
+                desktop_side="outgoing",
                 timestamp_text=created_at_text,
             )
         except Exception as exc:
@@ -2194,6 +2213,7 @@ def create_app(
                 status="成功",
                 file_size=size,
                 source=source,
+                desktop_side="incoming" if source == "mobile" else "outgoing",
                 timestamp_text=created_at_text,
             )
         except Exception as exc:

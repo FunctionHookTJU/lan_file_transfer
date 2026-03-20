@@ -12,8 +12,8 @@
       --line: #d7e0ea;
       --txt: #1d2b36;
       --muted: #607080;
-      --mobile: #e8f7ff;
-      --desktop: #eef8ea;
+      --bubble-outgoing: #e8f7ff;
+      --bubble-incoming: #eef8ea;
       --accent: #166534;
       --danger: #be123c;
     }
@@ -162,8 +162,8 @@
       display: flex;
     }
 
-    .row.mobile { justify-content: flex-end; }
-    .row.desktop { justify-content: flex-start; }
+    .row.outgoing { justify-content: flex-end; }
+    .row.incoming { justify-content: flex-start; }
     .row.selectable { cursor: pointer; }
     .row.selectable .bubble { transition: border-color 0.15s ease, box-shadow 0.15s ease; }
     .row.selectable.selected .bubble {
@@ -176,10 +176,10 @@
       border-radius: 12px;
       padding: 10px 12px;
       border: 1px solid var(--line);
-      background: var(--mobile);
+      background: var(--bubble-incoming);
     }
 
-    .row.desktop .bubble { background: var(--desktop); }
+    .row.outgoing .bubble { background: var(--bubble-outgoing); }
 
     .name {
       font-size: 14px;
@@ -1277,8 +1277,9 @@
     }
 
     function createRecordNode(record) {
+      const isOutgoing = isOutgoingRecord(record);
       const row = document.createElement('div');
-      row.className = `row ${record.source === 'desktop' ? 'desktop' : 'mobile'}`;
+      row.className = `row ${isOutgoing ? 'outgoing' : 'incoming'}`;
       row.dataset.recordId = record.id;
       if (state.role === 'desktop' && state.recordDeleteMode) {
         row.classList.add('selectable');
@@ -1339,6 +1340,16 @@
         });
       }
       return row;
+    }
+
+    function isOutgoingRecord(record) {
+      if (state.role === 'desktop') {
+        const desktopSide = String(record.desktop_side || '').trim().toLowerCase();
+        if (desktopSide === 'outgoing') return true;
+        if (desktopSide === 'incoming') return false;
+        return record.source === 'desktop';
+      }
+      return record.source === 'mobile';
     }
 
     function renderRecords() {
