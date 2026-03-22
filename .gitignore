@@ -4,32 +4,47 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Virtual environment
+# Virtual environments
 .venv/
 venv/
+env/
+ENV/
 
-# Tool caches
+# Tool/test caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # IDE/editor files
 .idea/
 .vscode/
 
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
 # Runtime/generated local data
 received_files/
+transient_uploads/
 *.log
+
+# Local capture/extract artifacts
+capture_upload.pcapng
+extracted_from_pcap/
 
 # Build and packaging artifacts (PyInstaller)
 build/*
-!build/build_all.ps1
-!build/build_all.bat
-!build/build_exe.ps1
-!build/build_exe.bat
+!build/*.ps1
+!build/*.bat
 dist/
 *.manifest
 *.pkg
+*.toc
+*.pyz
 
 # Installer output artifacts
 installer/Output/
