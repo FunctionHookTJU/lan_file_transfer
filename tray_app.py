@@ -408,6 +408,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-dir", default=None, help="保存目录（默认自动选择）")
     parser.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-terminal-qr", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--debug", action="store_true", help="调试模式（允许多实例运行）")
     return parser.parse_args()
 
 
@@ -424,15 +425,18 @@ def main() -> None:
         )
         return
 
-    guard = SingleInstanceGuard("LANFileTransfer.Tray.Singleton")
-    if not guard.acquire():
-        bring_running_window_to_front()
-        return
+    guard = None
+    if not args.debug:
+        guard = SingleInstanceGuard("LANFileTransfer.Tray.Singleton")
+        if not guard.acquire():
+            bring_running_window_to_front()
+            return
 
     try:
         TrayController(port=args.port, save_dir=save_dir).run()
     finally:
-        guard.release()
+        if guard:
+            guard.release()
 
 
 if __name__ == "__main__":

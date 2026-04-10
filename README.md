@@ -41,7 +41,10 @@ python app.py --no-terminal-qr
 
 ```bash
 python tray_app.py --port 5000
+python tray_app.py --port 5000 --debug
 ```
+
+`--debug` 用于调试时允许多开实例；不加该参数时，默认仍为单实例保护。
 
 托盘菜单支持：
 
@@ -54,6 +57,12 @@ python tray_app.py --port 5000
 
 ```powershell
 .\build\build_exe.ps1
+```
+
+调试打包（启用 PyInstaller debug bootloader）：
+
+```powershell
+.\build\build_exe.ps1 -DebugBuild
 ```
 
 产物：

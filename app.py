@@ -1,6 +1,8 @@
 import argparse
 import base64
+import errno
 import io
+import ipaddress
 import json
 import os
 import secrets
@@ -30,15 +32,97 @@ APP_NAME = "LANFileTransfer"
 DESKTOP_DEVICE_ID = "desktop"
 
 
-def get_lan_ip() -> str:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def is_usable_ipv4(ip_text: str) -> bool:
     try:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
+        ip = ipaddress.ip_address(str(ip_text or "").strip())
+    except ValueError:
+        return False
+    return (
+        ip.version == 4
+        and not ip.is_loopback
+        and not ip.is_link_local
+        and not ip.is_unspecified
+        and not ip.is_multicast
+    )
+
+
+def ipv4_priority_key(ip_text: str) -> tuple[int, str]:
+    ip = ipaddress.ip_address(ip_text)
+    # 优先私网地址，其次其他可用 IPv4。
+    return (0 if ip.is_private else 1, str(ip))
+
+
+def get_lan_ipv4_candidates() -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def push(value: str) -> None:
+        ip_text = str(value or "").strip()
+        if not ip_text or ip_text in seen or not is_usable_ipv4(ip_text):
+            return
+        seen.add(ip_text)
+        candidates.append(ip_text)
+
+    for endpoint in (("8.8.8.8", 80), ("1.1.1.1", 80), ("223.5.5.5", 80)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(endpoint)
+            push(sock.getsockname()[0])
+        except OSError:
+            continue
+        finally:
+            sock.close()
+
+    try:
+        host_ips = socket.gethostbyname_ex(socket.gethostname())[2]
     except OSError:
-        return "127.0.0.1"
-    finally:
-        sock.close()
+        host_ips = []
+    for ip_text in host_ips:
+        push(ip_text)
+
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        infos = []
+    for info in infos:
+        sockaddr = info[4]
+        if isinstance(sockaddr, tuple) and sockaddr:
+            push(str(sockaddr[0]))
+
+    candidates.sort(key=ipv4_priority_key)
+    return candidates
+
+
+def get_lan_ip() -> str:
+    candidates = get_lan_ipv4_candidates()
+    if candidates:
+        return candidates[0]
+    return "127.0.0.1"
+
+
+def infer_directed_broadcast_targets(ipv4_addresses: list[str]) -> list[str]:
+    targets: list[str] = []
+    seen: set[str] = set()
+
+    def push(ip_text: str) -> None:
+        value = str(ip_text or "").strip()
+        if not value or value in seen:
+            return
+        seen.add(value)
+        targets.append(value)
+
+    push("255.255.255.255")
+    for ip_text in ipv4_addresses:
+        if not is_usable_ipv4(ip_text):
+            continue
+        try:
+            iface_ip = ipaddress.ip_address(ip_text)
+        except ValueError:
+            continue
+        # 以 /24 子网推导定向广播，兼容多数家庭/办公局域网。
+        network = ipaddress.ip_network(f"{iface_ip}/24", strict=False)
+        push(str(network.broadcast_address))
+    return targets
 
 
 def find_available_port(start_port: int, host: str = "0.0.0.0", max_tries: int = 100) -> int:
@@ -201,16 +285,32 @@ def sanitize_filename_for_windows(name: str) -> str:
     return result or "downloaded_file"
 
 
-def allocate_unique_file_path(directory: Path, desired_name: str) -> Path:
+def allocate_unique_file_path(directory: Path, desired_name: str, reserve: bool = False) -> Path:
     clean_name = sanitize_filename_for_windows(desired_name)
     stem = Path(clean_name).stem or "downloaded_file"
     suffix = Path(clean_name).suffix
     candidate = directory / clean_name
     index = 1
-    while candidate.exists():
+    while True:
+        if not reserve:
+            if not candidate.exists():
+                return candidate
+        else:
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            if hasattr(os, "O_BINARY"):
+                flags |= os.O_BINARY
+            try:
+                fd = os.open(str(candidate), flags)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                if exc.errno != errno.EEXIST:
+                    raise
+            else:
+                os.close(fd)
+                return candidate
         candidate = directory / f"{stem} ({index}){suffix}"
         index += 1
-    return candidate
 
 
 def resolve_save_dir(raw_save_dir: Optional[str]) -> Path:
@@ -264,6 +364,7 @@ def create_app(
     transient_upload_dir: Path,
     base_url: str,
     lan_ip: str,
+    lan_ip_candidates: Optional[list[str]],
     http_port: int,
     local_device_id: str,
     local_device_name: str,
@@ -292,7 +393,12 @@ def create_app(
     record_map = {}
     clients = {}
     lock = threading.Lock()
-    trusted_desktop_ips = {"127.0.0.1", "::1", lan_ip}
+    trusted_desktop_ips = {"127.0.0.1", "::1"}
+    if is_usable_ipv4(lan_ip):
+        trusted_desktop_ips.add(lan_ip)
+    for candidate in (lan_ip_candidates or []):
+        if is_usable_ipv4(candidate):
+            trusted_desktop_ips.add(str(candidate))
     peer_discovery_port = 54546
     peer_announce_interval = 3.0
     peer_stale_seconds = 15
@@ -696,11 +802,15 @@ def create_app(
 
     def check_peer_health(host: str, port: int) -> bool:
         url = f"http://{host}:{int(port)}/health"
-        try:
-            resp = requests.get(url, timeout=(0.35, 0.6))
-        except requests.RequestException:
-            return False
-        return resp.status_code == 200
+        # 较轻网络抖动下给 2 次机会，避免误判离线。
+        for _ in range(2):
+            try:
+                resp = requests.get(url, timeout=(0.9, 1.6))
+            except requests.RequestException:
+                continue
+            if resp.status_code == 200:
+                return True
+        return False
 
     def find_reachable_paired_peer(
         device_id: str,
@@ -835,8 +945,8 @@ def create_app(
             if idx > 0 and hasattr(file_stream, "seek"):
                 try:
                     file_stream.seek(0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    return False, f"重试发送前无法复位文件流: {exc}", last_payload
             peer_host = str(peer_endpoint.get("host") or "").strip()
             peer_port = parse_peer_port(peer_endpoint.get("port"))
             if not peer_host or peer_port is None:
@@ -1123,6 +1233,27 @@ def create_app(
                     raise ValueError("上传文件超过大小限制")
         return total
 
+    def cleanup_transient_record_file(
+        transfer_id: str,
+        source_path: Path,
+        target_path: Path,
+        keep_source_when_same: bool = False,
+    ) -> None:
+        remove_record_cache_only(transfer_id)
+        if keep_source_when_same and source_path.resolve() == target_path.resolve():
+            return
+        try:
+            if source_path.exists():
+                source_path.unlink(missing_ok=True)
+        except Exception as exc:
+            app.logger.warning(
+                "transient cleanup failed transfer_id=%s source=%s target=%s error=%s",
+                transfer_id,
+                source_path,
+                target_path,
+                exc,
+            )
+
     def broadcast(event: dict, target_device_id: Optional[str] = None) -> None:
         payload = json.dumps(event, ensure_ascii=False)
         dead = []
@@ -1144,6 +1275,7 @@ def create_app(
     def run_peer_discovery() -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        announce_targets = infer_directed_broadcast_targets([lan_ip] + list(lan_ip_candidates or []))
         try:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -1162,10 +1294,16 @@ def create_app(
                         "ts": int(now),
                     }
                     packet = json.dumps(announce_payload, ensure_ascii=False).encode("utf-8")
-                    try:
-                        sender.sendto(packet, ("255.255.255.255", peer_discovery_port))
-                    except OSError:
-                        pass
+                    for target_host in announce_targets:
+                        try:
+                            sender.sendto(packet, (target_host, peer_discovery_port))
+                        except OSError as exc:
+                            app.logger.debug(
+                                "peer discovery broadcast failed target=%s port=%s error=%s",
+                                target_host,
+                                peer_discovery_port,
+                                exc,
+                            )
                     next_announce_at = now + peer_announce_interval
 
                 wait_seconds = max(0.2, min(1.0, next_announce_at - now))
@@ -1932,7 +2070,7 @@ def create_app(
         except Exception as exc:
             return jsonify({"error": f"保存目录不可用: {exc}"}), 500
 
-        destination = allocate_unique_file_path(target_dir, original_name)
+        destination = allocate_unique_file_path(target_dir, original_name, reserve=True)
         max_upload_bytes_local = app.config["MAX_UPLOAD_BYTES"]
         content_len = request.content_length
         if content_len is not None and content_len > max_upload_bytes_local + 1024 * 1024:
@@ -2130,7 +2268,7 @@ def create_app(
                 target_dir.mkdir(parents=True, exist_ok=True)
             except Exception as exc:
                 return jsonify({"error": f"保存目录不可用: {exc}"}), 500
-            destination = allocate_unique_file_path(target_dir, original_name)
+            destination = allocate_unique_file_path(target_dir, original_name, reserve=True)
             stored_name = destination.name
 
         max_upload_bytes_local = app.config["MAX_UPLOAD_BYTES"]
@@ -2261,6 +2399,16 @@ def create_app(
             download_name=record["name"],
             conditional=True,
         )
+        if record.get("transient"):
+            source_resolved = Path(record["path"]).resolve()
+            response.call_on_close(
+                lambda transfer_id=transfer_id, source_path=source_resolved: cleanup_transient_record_file(
+                    transfer_id,
+                    source_path,
+                    source_path,
+                    keep_source_when_same=False,
+                )
+            )
         send_history_update_event(transfer_id, target_device_id=req_device_id)
         return response
 
@@ -2293,6 +2441,7 @@ def create_app(
             req_device_id = DESKTOP_DEVICE_ID
 
         download_dir_local = Path(app.config["DOWNLOAD_DIR"]).resolve()
+        target_path: Optional[Path] = None
         source_parent_matches_download_dir = False
         try:
             download_dir_local.mkdir(parents=True, exist_ok=True)
@@ -2300,10 +2449,16 @@ def create_app(
             if source_parent_matches_download_dir:
                 target_path = source_resolved
             else:
-                target_path = allocate_unique_file_path(download_dir_local, record["name"])
+                target_path = allocate_unique_file_path(download_dir_local, record["name"], reserve=True)
                 shutil.copy2(source_path, target_path)
             target_resolved = target_path.resolve()
         except Exception as exc:
+            if target_path is not None and not source_parent_matches_download_dir:
+                try:
+                    if target_path.exists():
+                        target_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
             return jsonify({"error": f"保存失败: {exc}"}), 500
 
         try:
@@ -2323,19 +2478,12 @@ def create_app(
             return jsonify({"error": f"写入历史记录失败: {exc}"}), 500
 
         if record.get("transient"):
-            remove_record_cache_only(transfer_id)
-            if source_resolved != target_resolved:
-                try:
-                    if source_resolved.exists():
-                        source_resolved.unlink(missing_ok=True)
-                except Exception as exc:
-                    app.logger.warning(
-                        "transient cleanup failed transfer_id=%s source=%s target=%s error=%s",
-                        transfer_id,
-                        source_resolved,
-                        target_resolved,
-                        exc,
-                    )
+            cleanup_transient_record_file(
+                transfer_id,
+                source_resolved,
+                target_resolved,
+                keep_source_when_same=True,
+            )
 
         send_history_update_event(transfer_id, target_device_id=req_device_id)
         row = history_row_by_id(transfer_id)
@@ -2430,7 +2578,8 @@ def start_server(
     if selected_port != port:
         print(f"Port {port} is occupied, switched to {selected_port}")
 
-    lan_ip = get_lan_ip()
+    lan_ip_candidates = get_lan_ipv4_candidates()
+    lan_ip = lan_ip_candidates[0] if lan_ip_candidates else "127.0.0.1"
     base_url = f"http://{lan_ip}:{selected_port}"
     initial_mobile_token = uuid.uuid4().hex
     mobile_url = f"{base_url}/?token={initial_mobile_token}"
@@ -2467,6 +2616,7 @@ def start_server(
         transient_upload_dir=transient_upload_dir,
         base_url=base_url,
         lan_ip=lan_ip,
+        lan_ip_candidates=lan_ip_candidates,
         http_port=selected_port,
         local_device_id=local_device_id,
         local_device_name=local_device_name,

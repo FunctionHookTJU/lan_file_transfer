@@ -1,6 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
+import os
+
+DEBUG_BUILD = os.environ.get("LANFILETRANSFER_PYI_DEBUG", "0") == "1"
+
+
 a = Analysis(
     ['tray_app.py'],
     pathex=[],
@@ -23,7 +28,7 @@ exe = EXE(
     a.datas,
     [],
     name='LANFileTransfer',
-    debug=False,
+    debug=DEBUG_BUILD,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
