@@ -4,7 +4,9 @@ import errno
 import io
 import ipaddress
 import json
+import logging
 import os
+import random
 import secrets
 import shutil
 import socket
@@ -22,6 +24,13 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_logger = logging.getLogger("LANFileTransfer")
 
 from flask import Flask, jsonify, make_response, render_template, request, send_file
 from flask_sock import Sock
@@ -95,9 +104,23 @@ def get_lan_ipv4_candidates() -> list[str]:
 
 def get_lan_ip() -> str:
     candidates = get_lan_ipv4_candidates()
+    selected = get_selected_lan_ip(candidates)
+    if selected:
+        return selected
     if candidates:
         return candidates[0]
     return "127.0.0.1"
+
+
+def get_selected_lan_ip(candidates: list[str]) -> Optional[str]:
+    settings = load_runtime_settings()
+    preferred = settings.get("selected_lan_ip")
+    if not preferred or not isinstance(preferred, str):
+        return None
+    preferred = preferred.strip()
+    if preferred in candidates:
+        return preferred
+    return None
 
 
 def infer_directed_broadcast_targets(ipv4_addresses: list[str]) -> list[str]:
@@ -393,6 +416,7 @@ def create_app(
     record_map = {}
     clients = {}
     lock = threading.Lock()
+    file_lock = threading.Lock()
     trusted_desktop_ips = {"127.0.0.1", "::1"}
     if is_usable_ipv4(lan_ip):
         trusted_desktop_ips.add(lan_ip)
@@ -400,6 +424,10 @@ def create_app(
         if is_usable_ipv4(candidate):
             trusted_desktop_ips.add(str(candidate))
     peer_discovery_port = 54546
+    runtime_settings = load_runtime_settings()
+    configured_port = runtime_settings.get("peer_discovery_port")
+    if isinstance(configured_port, int) and 1024 <= configured_port <= 65535:
+        peer_discovery_port = configured_port
     peer_announce_interval = 3.0
     peer_stale_seconds = 15
     pair_request_ttl_seconds = 120
@@ -802,11 +830,13 @@ def create_app(
 
     def check_peer_health(host: str, port: int) -> bool:
         url = f"http://{host}:{int(port)}/health"
-        # 较轻网络抖动下给 2 次机会，避免误判离线。
-        for _ in range(2):
+        for attempt in range(2):
             try:
-                resp = requests.get(url, timeout=(0.9, 1.6))
-            except requests.RequestException:
+                resp = requests.get(url, timeout=(1.5, 3.0))
+            except requests.RequestException as exc:
+                _logger.debug("health check attempt %d failed for %s:%d: %s", attempt + 1, host, port, exc)
+                if attempt < 1:
+                    time.sleep(random.uniform(0.2, 0.8))
                 continue
             if resp.status_code == 200:
                 return True
@@ -946,7 +976,25 @@ def create_app(
                 try:
                     file_stream.seek(0)
                 except Exception as exc:
+                    _logger.warning("relay retry seek(0) failed for %s: %s", file_name, exc)
                     return False, f"重试发送前无法复位文件流: {exc}", last_payload
+                if hasattr(file_stream, "tell"):
+                    try:
+                        if file_stream.tell() != 0:
+                            _logger.warning("relay retry seek verification failed for %s, stream position != 0", file_name)
+                            return False, "重试发送前文件流复位校验失败", last_payload
+                    except Exception as exc:
+                        _logger.warning("relay retry tell() failed for %s: %s", file_name, exc)
+                        return False, f"重试发送前无法读取文件流位置: {exc}", last_payload
+                if file_size_hint > 0 and hasattr(file_stream, "seek"):
+                    try:
+                        file_stream.seek(0, os.SEEK_END)
+                        end_pos = file_stream.tell()
+                        file_stream.seek(0, os.SEEK_SET) if hasattr(file_stream, "tell") else file_stream.seek(0)
+                        if end_pos != file_size_hint:
+                            _logger.warning("relay retry file size mismatch for %s: expected %d, got %d", file_name, file_size_hint, end_pos)
+                    except Exception:
+                        pass
             peer_host = str(peer_endpoint.get("host") or "").strip()
             peer_port = parse_peer_port(peer_endpoint.get("port"))
             if not peer_host or peer_port is None:
@@ -1213,7 +1261,7 @@ def create_app(
             settings[key] = value
             save_runtime_settings(settings)
         except Exception:
-            pass
+            _logger.warning("Failed to persist runtime setting '%s': skipping", key)
 
     def stream_to_disk(
         file_stream,
@@ -1232,6 +1280,24 @@ def create_app(
                 if max_bytes is not None and total > max_bytes:
                     raise ValueError("上传文件超过大小限制")
         return total
+
+    def cleanup_stale_transient_files(max_age_hours: float = 24.0) -> int:
+        transient_dir = app.config["TRANSIENT_UPLOAD_DIR"]
+        if not transient_dir.exists():
+            return 0
+        cutoff = time.time() - max_age_hours * 3600
+        removed = 0
+        for entry in transient_dir.iterdir():
+            if not entry.is_file():
+                continue
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    entry.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                pass
+        _logger.info("transient cleanup removed %d stale files from %s", removed, transient_dir)
+        return removed
 
     def cleanup_transient_record_file(
         transfer_id: str,
@@ -1276,6 +1342,8 @@ def create_app(
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         announce_targets = infer_directed_broadcast_targets([lan_ip] + list(lan_ip_candidates or []))
+        last_tcp_probe_at = 0.0
+        tcp_probe_interval = 8.0
         try:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -1305,6 +1373,28 @@ def create_app(
                                 exc,
                             )
                     next_announce_at = now + peer_announce_interval
+
+                if now - last_tcp_probe_at >= tcp_probe_interval:
+                    with lock:
+                        tcp_probe_targets = [
+                            (peer_id, str(peer.get("host", "").strip()), int(peer.get("port", 0)))
+                            for peer_id, peer in paired_desktops.items()
+                            if str(peer.get("host", "").strip()) and int(peer.get("port", 0)) > 0
+                        ]
+                    for peer_id, peer_host, peer_port in tcp_probe_targets:
+                        if check_peer_health(peer_host, peer_port):
+                            with lock:
+                                peer = paired_desktops.get(peer_id)
+                                if peer is not None:
+                                    refresh_discovered_from_peer_locked(
+                                        peer_id,
+                                        str(peer.get("device_name", f"电脑-{peer_id[:8]}")),
+                                        peer_host,
+                                        peer_port,
+                                        seen_at=now,
+                                    )
+                            _logger.debug("TCP probe succeeded for paired device %s at %s:%d", peer_id, peer_host, peer_port)
+                    last_tcp_probe_at = now
 
                 wait_seconds = max(0.2, min(1.0, next_announce_at - now))
                 listener.settimeout(wait_seconds)
@@ -1352,6 +1442,7 @@ def create_app(
 
     ensure_history_schema()
     load_paired_desktops()
+    cleanup_stale_transient_files()
     start_peer_discovery()
 
     def is_trusted_desktop(ip: Optional[str]) -> bool:
@@ -1758,6 +1849,7 @@ def create_app(
                 }
 
         if auto_accept:
+            _logger.info("Auto-accepting pair request from %s (%s)", from_device_id, from_device_name)
             persist_paired_desktops()
             ok, error = send_pairing_response_callback(from_base_url, request_id, True, "")
             notify_desktop_clients(
@@ -1796,6 +1888,7 @@ def create_app(
         callback_ok, callback_error = send_pairing_response_callback(callback_base_url, request_id, accepted, "")
 
         if accepted:
+            _logger.info("Pair request accepted: %s (%s)", req["from_device_id"], req["from_device_name"])
             with lock:
                 paired_desktops[req["from_device_id"]] = {
                     "device_name": req["from_device_name"],
@@ -1932,6 +2025,62 @@ def create_app(
             return jsonify({"error": f"打开目录失败: {exc}"}), 500
 
         return jsonify({"ok": True, "download_dir": str(download_dir_local)})
+
+    @app.get("/settings/lan-ip")
+    def get_lan_ip_candidates():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可查看局域网IP"}), 403
+        candidates = get_lan_ipv4_candidates()
+        selected_ip = get_selected_lan_ip(candidates)
+        current_ip = selected_ip or (candidates[0] if candidates else "127.0.0.1")
+        return jsonify({
+            "candidates": candidates,
+            "selected_ip": selected_ip,
+            "current_ip": current_ip,
+        })
+
+    @app.post("/settings/lan-ip")
+    def select_lan_ip():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可设置局域网IP"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        raw_ip = str(payload.get("selected_ip", "")).strip()
+        if not raw_ip:
+            return jsonify({"error": "缺少 selected_ip"}), 400
+
+        candidates = get_lan_ipv4_candidates()
+        if raw_ip not in candidates:
+            return jsonify({"error": f"IP {raw_ip} 不在当前可用候选列表中", "candidates": candidates}), 400
+
+        persist_runtime_setting("selected_lan_ip", raw_ip)
+        _logger.info("用户选择 LAN IP: %s (需重启生效)", raw_ip)
+        return jsonify({"ok": True, "selected_ip": raw_ip, "note": "重启服务后生效"})
+
+    @app.get("/settings/discovery-port")
+    def get_discovery_port():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可查看发现端口"}), 403
+        return jsonify({"discovery_port": peer_discovery_port})
+
+    @app.post("/settings/discovery-port")
+    def set_discovery_port():
+        if not is_trusted_desktop(request.remote_addr):
+            return jsonify({"error": "仅电脑端可设置发现端口"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        try:
+            new_port = int(payload.get("discovery_port", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "discovery_port 必须是整数"}), 400
+
+        if new_port < 1024 or new_port > 65535:
+            return jsonify({"error": "发现端口需在 1024-65535 之间"}), 400
+
+        nonlocal peer_discovery_port
+        persist_runtime_setting("peer_discovery_port", new_port)
+        _logger.info("用户设置发现端口: %d (需重启生效)", new_port)
+        return jsonify({"ok": True, "discovery_port": new_port, "note": "重启服务后生效"})
 
     @app.post("/records/<record_id>/open-folder")
     def open_record_folder(record_id: str):
@@ -2070,7 +2219,8 @@ def create_app(
         except Exception as exc:
             return jsonify({"error": f"保存目录不可用: {exc}"}), 500
 
-        destination = allocate_unique_file_path(target_dir, original_name, reserve=True)
+        with file_lock:
+            destination = allocate_unique_file_path(target_dir, original_name, reserve=True)
         max_upload_bytes_local = app.config["MAX_UPLOAD_BYTES"]
         content_len = request.content_length
         if content_len is not None and content_len > max_upload_bytes_local + 1024 * 1024:
@@ -2268,8 +2418,9 @@ def create_app(
                 target_dir.mkdir(parents=True, exist_ok=True)
             except Exception as exc:
                 return jsonify({"error": f"保存目录不可用: {exc}"}), 500
+        with file_lock:
             destination = allocate_unique_file_path(target_dir, original_name, reserve=True)
-            stored_name = destination.name
+        stored_name = destination.name
 
         max_upload_bytes_local = app.config["MAX_UPLOAD_BYTES"]
         content_len = request.content_length
@@ -2449,7 +2600,8 @@ def create_app(
             if source_parent_matches_download_dir:
                 target_path = source_resolved
             else:
-                target_path = allocate_unique_file_path(download_dir_local, record["name"], reserve=True)
+                with file_lock:
+                    target_path = allocate_unique_file_path(download_dir_local, record["name"], reserve=True)
                 shutil.copy2(source_path, target_path)
             target_resolved = target_path.resolve()
         except Exception as exc:
@@ -2458,7 +2610,7 @@ def create_app(
                     if target_path.exists():
                         target_path.unlink(missing_ok=True)
                 except Exception:
-                    pass
+                    _logger.debug("Failed to clean up failed save target for %s", record.get("name", "unknown"))
             return jsonify({"error": f"保存失败: {exc}"}), 500
 
         try:

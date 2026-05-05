@@ -51,3 +51,4 @@ installer/Output/
 installer/build/
 installer/dist/
 *.msi
+.aider*
