@@ -3,6 +3,8 @@ import base64
 import errno
 import io
 import ipaddress
+import ctypes
+from ctypes import wintypes
 import json
 import logging
 import os
@@ -24,6 +26,8 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,6 +127,121 @@ def get_selected_lan_ip(candidates: list[str]) -> Optional[str]:
     return None
 
 
+def get_interface_subnet_info() -> list[tuple[str, str, str]]:
+    """Returns list of (ip_address, subnet_mask, broadcast_address) tuples from actual OS network config."""
+    results: list[tuple[str, str, str]] = []
+    if sys.platform.startswith("win"):
+        try:
+            # Windows: use iphlpapi.GetAdaptersInfo
+            MAX_ADAPTER_NAME_LENGTH = 256
+            MAX_ADAPTER_DESCRIPTION_LENGTH = 128
+            MAX_ADAPTER_ADDRESS_LENGTH = 8
+
+            class _IP_ADDR_STRING(ctypes.Structure):
+                pass
+
+            _IP_ADDR_STRING._fields_ = [
+                ("Next", ctypes.POINTER(_IP_ADDR_STRING)),
+                ("IpAddress", ctypes.c_char * 16),
+                ("IpMask", ctypes.c_char * 16),
+                ("Context", wintypes.DWORD),
+            ]
+
+            class _IP_ADAPTER_INFO(ctypes.Structure):
+                pass
+
+            _IP_ADAPTER_INFO._fields_ = [
+                ("Next", ctypes.POINTER(_IP_ADAPTER_INFO)),
+                ("ComboIndex", wintypes.DWORD),
+                ("AdapterName", ctypes.c_char * (MAX_ADAPTER_NAME_LENGTH + 4)),
+                ("Description", ctypes.c_char * (MAX_ADAPTER_DESCRIPTION_LENGTH + 4)),
+                ("AddressLength", wintypes.UINT),
+                ("Address", ctypes.c_ubyte * MAX_ADAPTER_ADDRESS_LENGTH),
+                ("Index", wintypes.DWORD),
+                ("Type", wintypes.UINT),
+                ("DhcpEnabled", wintypes.UINT),
+                ("CurrentIpAddress", ctypes.POINTER(_IP_ADDR_STRING)),
+                ("IpAddressList", _IP_ADDR_STRING),
+                ("GatewayList", _IP_ADDR_STRING),
+                ("DhcpServer", _IP_ADDR_STRING),
+                ("HaveWins", wintypes.BOOL),
+                ("PrimaryWinsServer", _IP_ADDR_STRING),
+                ("SecondaryWinsServer", _IP_ADDR_STRING),
+                ("LeaseObtained", wintypes.DWORD),
+                ("LeaseExpires", wintypes.DWORD),
+            ]
+
+            iphlpapi = ctypes.windll.iphlpapi
+            size = wintypes.ULONG(0)
+            ret = iphlpapi.GetAdaptersInfo(None, ctypes.byref(size))
+            if ret == 111:  # ERROR_BUFFER_OVERFLOW
+                buffer = ctypes.create_string_buffer(size.value)
+                adapter_ptr = ctypes.cast(buffer, ctypes.POINTER(_IP_ADAPTER_INFO))
+                ret = iphlpapi.GetAdaptersInfo(adapter_ptr, ctypes.byref(size))
+                if ret == 0:  # NO_ERROR
+                    current = adapter_ptr
+                    while current:
+                        addr = current.contents.IpAddressList
+                        while True:
+                            ip_str = addr.IpAddress.decode("ascii", errors="ignore").strip("\x00")
+                            mask_str = addr.IpMask.decode("ascii", errors="ignore").strip("\x00")
+                            if ip_str and mask_str and ip_str != "0.0.0.0":
+                                try:
+                                    ip_obj = ipaddress.ip_address(ip_str)
+                                    mask_obj = ipaddress.ip_address(mask_str)
+                                    if ip_obj.version == 4 and mask_obj.version == 4:
+                                        # Calculate prefix length from mask
+                                        mask_int = int(mask_obj)
+                                        prefix_len = bin(mask_int).count("1")
+                                        network = ipaddress.ip_network(f"{ip_str}/{prefix_len}", strict=False)
+                                        results.append((ip_str, mask_str, str(network.broadcast_address)))
+                                except ValueError:
+                                    pass
+                            if addr.Next:
+                                addr = addr.Next.contents
+                            else:
+                                break
+                        if current.contents.Next:
+                            current = current.contents.Next.contents
+                        else:
+                            break
+        except Exception:
+            pass
+    else:
+        # Linux/Mac: try netifaces if available, else fall back
+        try:
+            import fcntl
+            import struct
+            SIOCGIFNETMASK = 0x891B
+            SIOCGIFBRDADDR = 0x8919
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                for ifname in socket.if_nameindex():
+                    name = ifname[1]
+                    try:
+                        ifreq = struct.pack("256s", name[:15].encode("utf-8"))
+                        mask_raw = fcntl.ioctl(sock.fileno(), SIOCGIFNETMASK, ifreq)
+                        mask = socket.inet_ntoa(mask_raw[20:24])
+                        brd_raw = fcntl.ioctl(sock.fileno(), SIOCGIFBRDADDR, ifreq)
+                        brd = socket.inet_ntoa(brd_raw[20:24])
+                        # Get IP via getsockname-like approach or just use the interface
+                        try:
+                            ip_raw = fcntl.ioctl(sock.fileno(), 0x8915, ifreq)  # SIOCGIFADDR
+                            ip = socket.inet_ntoa(ip_raw[20:24])
+                        except OSError:
+                            ip = ""
+                        if ip and ip != "0.0.0.0" and mask != "0.0.0.0" and not ip.startswith("127."):
+                            results.append((ip, mask, brd))
+                    except OSError:
+                        continue
+            finally:
+                sock.close()
+        except (ImportError, OSError):
+            pass
+
+    return results
+
+
 def infer_directed_broadcast_targets(ipv4_addresses: list[str]) -> list[str]:
     targets: list[str] = []
     seen: set[str] = set()
@@ -135,16 +254,27 @@ def infer_directed_broadcast_targets(ipv4_addresses: list[str]) -> list[str]:
         targets.append(value)
 
     push("255.255.255.255")
+
+    # First priority: actual subnet broadcast addresses from OS
+    subnet_info = get_interface_subnet_info()
+    for ip_str, _mask_str, broadcast_addr in subnet_info:
+        if ip_str in ipv4_addresses and broadcast_addr and broadcast_addr != "255.255.255.255":
+            push(broadcast_addr)
+
+    # Fallback: /24 heuristic for any IP not covered by actual subnet info
+    covered_ips = {item[0] for item in subnet_info}
     for ip_text in ipv4_addresses:
-        if not is_usable_ipv4(ip_text):
+        if not is_usable_ipv4(ip_text) or ip_text in covered_ips:
             continue
         try:
             iface_ip = ipaddress.ip_address(ip_text)
         except ValueError:
             continue
-        # 以 /24 子网推导定向广播，兼容多数家庭/办公局域网。
         network = ipaddress.ip_network(f"{iface_ip}/24", strict=False)
-        push(str(network.broadcast_address))
+        broadcast = str(network.broadcast_address)
+        if broadcast != "255.255.255.255":
+            push(broadcast)
+
     return targets
 
 
@@ -923,12 +1053,39 @@ def create_app(
                 if fallback_port not in candidate_ports:
                     candidate_ports.append(fallback_port)
 
-            for port in candidate_ports:
+            # Parallel port probing for faster reachability detection
+            def _probe_port(port: int) -> Optional[tuple[int, str, int]]:
                 endpoint = (host, int(port))
                 if exclude_endpoint is not None and endpoint == exclude_endpoint:
-                    continue
-                if not check_peer_health(host, port):
-                    continue
+                    return None
+                if check_peer_health(host, port):
+                    return (port, host, int(port))
+                return None
+
+            dedup_ports: list[int] = []
+            seen_p: set[int] = set()
+            for p in candidate_ports:
+                if p not in seen_p:
+                    seen_p.add(p)
+                    dedup_ports.append(p)
+
+            # Probe in parallel batches of 10, return first success
+            batch_size = 10
+            found: Optional[tuple[int, str, int]] = None
+            for batch_start in range(0, len(dedup_ports), batch_size):
+                batch = dedup_ports[batch_start:batch_start + batch_size]
+                with ThreadPoolExecutor(max_workers=min(len(batch), 8)) as executor:
+                    futures = {executor.submit(_probe_port, p): p for p in batch}
+                    for future in as_completed(futures):
+                        result = future.result()
+                        if result is not None:
+                            found = result
+                            break
+                if found is not None:
+                    break
+
+            if found is not None:
+                _port, _host, port = found
                 with lock:
                     refresh_discovered_from_peer_locked(target_id, device_name, host, int(port), seen_at=time.time())
                 persist_paired_desktops()
@@ -993,8 +1150,10 @@ def create_app(
                         file_stream.seek(0, os.SEEK_SET) if hasattr(file_stream, "tell") else file_stream.seek(0)
                         if end_pos != file_size_hint:
                             _logger.warning("relay retry file size mismatch for %s: expected %d, got %d", file_name, file_size_hint, end_pos)
-                    except Exception:
-                        pass
+                            return False, f"重试前文件大小不一致: 预期 {file_size_hint}，实际 {end_pos}", last_payload
+                    except Exception as exc:
+                        _logger.warning("relay retry size verification failed for %s: %s", file_name, exc)
+                        return False, f"重试前无法校验文件大小: {exc}", last_payload
             peer_host = str(peer_endpoint.get("host") or "").strip()
             peer_port = parse_peer_port(peer_endpoint.get("port"))
             if not peer_host or peer_port is None:
@@ -1350,6 +1509,56 @@ def create_app(
             listener.bind(("0.0.0.0", peer_discovery_port))
             sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
+            # Immediate announcement on startup for faster initial discovery
+            announce_payload = {
+                "type": "lft_announce",
+                "device_id": self_device_id,
+                "device_name": self_device_name,
+                "http_port": int(app.config["HTTP_PORT"]),
+                "ts": int(time.time()),
+            }
+            packet = json.dumps(announce_payload, ensure_ascii=False).encode("utf-8")
+            for target_host in announce_targets:
+                try:
+                    sender.sendto(packet, (target_host, peer_discovery_port))
+                except OSError:
+                    pass
+
+            # Active TCP neighbor scan on startup: probe common LAN neighbors
+            def _startup_neighbor_scan() -> None:
+                """Scan neighboring IPs on the local subnet to discover peers faster."""
+                time.sleep(0.5)
+                http_port = int(app.config["HTTP_PORT"])
+                scan_ports = [http_port] if 5000 <= http_port <= 5050 else [http_port, 5000]
+                # Determine scan range from LAN IP
+                scan_ip = lan_ip
+                try:
+                    ip_obj = ipaddress.ip_address(scan_ip)
+                except ValueError:
+                    return
+                # Build neighbor IPs to scan (narrow range: this device +/- 15)
+                ip_int = int(ip_obj)
+                base = ip_int & 0xFFFFFF00
+                local_octet = ip_int & 0xFF
+                start_octet = max(1, local_octet - 15)
+                end_octet = min(254, local_octet + 15)
+                neighbors = []
+                for octet in range(start_octet, end_octet + 1):
+                    if octet == local_octet:
+                        continue
+                    neighbors.append(ipaddress.ip_address(base | octet))
+                for neighbor_ip in neighbors:
+                    neighbor_str = str(neighbor_ip)
+                    if not is_usable_ipv4(neighbor_str):
+                        continue
+                    for scan_port in scan_ports:
+                        if check_peer_health(neighbor_str, scan_port):
+                            _logger.info("Startup neighbor scan found peer at %s:%d", neighbor_str, scan_port)
+                            break
+                    time.sleep(0.05)  # Small delay to avoid flooding
+
+            threading.Thread(target=_startup_neighbor_scan, daemon=True, name="lft-startup-scan").start()
+
             next_announce_at = 0.0
             while True:
                 now = time.time()
@@ -1440,10 +1649,97 @@ def create_app(
     def start_peer_discovery() -> None:
         threading.Thread(target=run_peer_discovery, daemon=True, name="lft-peer-discovery").start()
 
+    def start_mdns_discovery() -> None:
+        """Start mDNS/Zeroconf service advertisement and browsing as secondary discovery channel."""
+        _mdns_running = {"zc": None, "info": None}
+
+        def run_mdns() -> None:
+            try:
+                zc = Zeroconf()
+                _mdns_running["zc"] = zc
+                service_type = "_lft._tcp.local."
+                service_name = f"{self_device_name} ({self_device_id[:8]})._lft._tcp.local."
+
+                # Register our service
+                info = ServiceInfo(
+                    service_type,
+                    service_name,
+                    addresses=[socket.inet_aton(lan_ip)],
+                    port=int(app.config["HTTP_PORT"]),
+                    properties={
+                        b"device_id": self_device_id.encode("utf-8"),
+                        b"device_name": self_device_name.encode("utf-8"),
+                        b"http_port": str(app.config["HTTP_PORT"]).encode("utf-8"),
+                    },
+                )
+                _mdns_running["info"] = info
+                zc.register_service(info)
+
+                class _LFTBrowserListener:
+                    def add_service(self, zc_obj, type_name, name):
+                        try:
+                            svc_info = zc_obj.get_service_info(type_name, name, timeout=2000)
+                            if svc_info is None:
+                                return
+                            props = svc_info.properties
+                            peer_id_bytes = props.get(b"device_id")
+                            if not peer_id_bytes:
+                                return
+                            peer_id = normalize_device_id(peer_id_bytes.decode("utf-8"))
+                            if not peer_id or peer_id == self_device_id:
+                                return
+                            peer_name_bytes = props.get(b"device_name")
+                            peer_name = peer_name_bytes.decode("utf-8") if peer_name_bytes else f"电脑-{peer_id[:8]}"
+                            port_bytes = props.get(b"http_port")
+                            try:
+                                peer_port = int(port_bytes.decode("utf-8")) if port_bytes else 0
+                            except (TypeError, ValueError, AttributeError):
+                                peer_port = 0
+                            if peer_port <= 0 or peer_port > 65535:
+                                return
+                            host = socket.inet_ntoa(svc_info.addresses[0]) if svc_info.addresses else ""
+                            if not host:
+                                return
+                            with lock:
+                                refresh_discovered_from_peer_locked(
+                                    peer_id,
+                                    normalize_peer_name(peer_name, fallback=f"电脑-{peer_id[:8]}"),
+                                    host,
+                                    peer_port,
+                                    seen_at=time.time(),
+                                )
+                                cleanup_discovered_desktops_locked()
+                        except Exception as exc:
+                            _logger.debug("mDNS add_service error: %s", exc)
+
+                    def remove_service(self, zc_obj, type_name, name):
+                        pass
+
+                    def update_service(self, zc_obj, type_name, name):
+                        self.add_service(zc_obj, type_name, name)
+
+                browser = ServiceBrowser(zc, service_type, listener=_LFTBrowserListener())
+
+                while True:
+                    time.sleep(5)
+            except Exception as exc:
+                _logger.info("mDNS discovery unavailable: %s", exc)
+            finally:
+                if _mdns_running["zc"] is not None:
+                    try:
+                        if _mdns_running["info"] is not None:
+                            _mdns_running["zc"].unregister_service(_mdns_running["info"])
+                        _mdns_running["zc"].close()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=run_mdns, daemon=True, name="lft-mdns-discovery").start()
+
     ensure_history_schema()
     load_paired_desktops()
     cleanup_stale_transient_files()
     start_peer_discovery()
+    start_mdns_discovery()
 
     def is_trusted_desktop(ip: Optional[str]) -> bool:
         return bool(ip and ip in trusted_desktop_ips)
