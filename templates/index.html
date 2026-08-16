@@ -661,6 +661,11 @@
         <button class="btn" id="openDownloadDirBtn" type="button">打开目录</button>
         <button class="btn" id="resetDownloadDirBtn" type="button">恢复默认</button>
       </div>
+      <div class="setting-row" id="lanIpRow">
+        <span>局域网 IP</span>
+        <select class="setting-input" id="lanIpSelect" style="min-width: 240px;"></select>
+        <button class="btn" id="saveLanIpBtn" type="button">保存</button>
+      </div>
       <div class="setting-row" id="sendTargetRow">
         <span>发送目标</span>
         <select class="setting-input" id="sendTargetSelect" style="min-width: 240px;"></select>
@@ -797,6 +802,9 @@
       saveDownloadDirBtn: document.getElementById('saveDownloadDirBtn'),
       openDownloadDirBtn: document.getElementById('openDownloadDirBtn'),
       resetDownloadDirBtn: document.getElementById('resetDownloadDirBtn'),
+      lanIpRow: document.getElementById('lanIpRow'),
+      lanIpSelect: document.getElementById('lanIpSelect'),
+      saveLanIpBtn: document.getElementById('saveLanIpBtn'),
       sendTargetRow: document.getElementById('sendTargetRow'),
       sendTargetSelect: document.getElementById('sendTargetSelect'),
       peerDiscoveryRow: document.getElementById('peerDiscoveryRow'),
@@ -2357,6 +2365,58 @@
       }
     }
 
+    async function loadLanIpOptions() {
+      if (!ui.lanIpSelect) return;
+      try {
+        const resp = await fetch('/settings/lan-ip', { headers: authHeaders() });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+        ui.lanIpSelect.innerHTML = '';
+        if (candidates.length === 0) {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = '未检测到可用 IP';
+          ui.lanIpSelect.appendChild(opt);
+          return;
+        }
+        for (const ip of candidates) {
+          const opt = document.createElement('option');
+          opt.value = ip;
+          opt.textContent = ip + (ip === data.current_ip ? '（当前）' : '');
+          ui.lanIpSelect.appendChild(opt);
+        }
+        if (data.current_ip && candidates.includes(data.current_ip)) {
+          ui.lanIpSelect.value = data.current_ip;
+        }
+      } catch (_) {
+      }
+    }
+
+    async function saveLanIp() {
+      const selected = (ui.lanIpSelect.value || '').trim();
+      if (!selected) {
+        showToast('没有可用的局域网 IP');
+        return;
+      }
+      try {
+        const resp = await fetch('/settings/lan-ip', {
+          method: 'POST',
+          headers: {
+            ...authHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ selected_ip: selected }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `保存失败(${resp.status})`);
+        showToast('局域网 IP 已保存，重启服务后生效');
+      } catch (err) {
+        console.error(err);
+        showToast('保存失败：' + (err.message || '未知错误'));
+      }
+    }
+
     function bindEvents() {
       const onPywebviewReady = () => {
         syncDirectoryPickerAvailability();
@@ -2420,6 +2480,9 @@
         ui.pairedDevicesRow.style.display = 'flex';
         if (ui.recordDeleteRow) ui.recordDeleteRow.style.display = 'flex';
         ui.saveLimitBtn.addEventListener('click', () => saveUploadLimit());
+        if (ui.saveLanIpBtn) {
+          ui.saveLanIpBtn.addEventListener('click', () => saveLanIp());
+        }
         ui.pickDownloadDirBtn.addEventListener('click', () => pickDownloadDir());
         ui.saveDownloadDirBtn.addEventListener('click', () => saveDownloadDir());
         ui.openDownloadDirBtn.addEventListener('click', () => openDownloadDir());
@@ -2499,6 +2562,7 @@
         if (ui.cameraBtn) ui.cameraBtn.style.display = 'inline-flex';
         ui.limitRow.style.display = 'none';
         ui.downloadDirRow.style.display = 'none';
+        if (ui.lanIpRow) ui.lanIpRow.style.display = 'none';
         ui.sendTargetRow.style.display = 'none';
         ui.peerDiscoveryRow.style.display = 'none';
         ui.pairRequestsRow.style.display = 'none';
@@ -2511,7 +2575,10 @@
     async function init() {
       ui.meta.textContent = `${location.origin} · 当前设备: ${state.role === 'desktop' ? '电脑端' : '手机端'}`;
       syncLimitInput();
-      if (state.role === 'desktop') renderPeerState();
+      if (state.role === 'desktop') {
+        renderPeerState();
+        loadLanIpOptions();
+      }
       if (serverConfig.accessDenied) {
         setStatus('未授权访问', false, true);
         ui.tip.textContent = serverConfig.accessDeniedReason || '当前访问未授权，请重新扫码。';

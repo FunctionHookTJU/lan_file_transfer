@@ -40,6 +40,7 @@ from flask import Flask, jsonify, make_response, render_template, request, send_
 from flask_sock import Sock
 from qrcode import QRCode
 import requests
+from werkzeug.wsgi import ClosingIterator
 
 APP_NAME = "LANFileTransfer"
 DESKTOP_DEVICE_ID = "desktop"
@@ -389,6 +390,9 @@ def default_download_dir() -> Path:
     return (Path.home() / "Downloads").resolve()
 
 
+_settings_lock = threading.Lock()
+
+
 def settings_file_path() -> Path:
     local_appdata = os.getenv("LOCALAPPDATA")
     base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
@@ -397,7 +401,7 @@ def settings_file_path() -> Path:
     return settings_dir / "settings.json"
 
 
-def load_runtime_settings() -> dict:
+def _read_settings_unlocked() -> dict:
     path = settings_file_path()
     if not path.exists():
         return {}
@@ -407,9 +411,19 @@ def load_runtime_settings() -> dict:
         return {}
 
 
-def save_runtime_settings(settings: dict) -> None:
+def _write_settings_unlocked(settings: dict) -> None:
     path = settings_file_path()
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_runtime_settings() -> dict:
+    with _settings_lock:
+        return _read_settings_unlocked()
+
+
+def save_runtime_settings(settings: dict) -> None:
+    with _settings_lock:
+        _write_settings_unlocked(settings)
 
 
 def normalize_download_dir(raw_dir: str) -> Optional[Path]:
@@ -479,6 +493,30 @@ def resolve_save_dir(raw_save_dir: Optional[str]) -> Path:
 
     base_dir = Path(__file__).resolve().parent
     return (base_dir / save_dir).resolve()
+
+
+def attach_response_close_hooks(response):
+    """send_file 返回的响应是 direct_passthrough 模式，WSGI 服务器不会调用
+    Response.close()，导致 call_on_close 回调（状态标记/瞬态清理）永不执行。
+    手动将响应体包装为 ClosingIterator，保证响应结束（含客户端中断）时触发回调。
+
+    注意：ClosingIterator 会把内层迭代器的 close 加入回调首位且无幂等保护，
+    因此关闭前必须先把 response.response 摘除（置空），避免递归 close。
+    """
+    if not getattr(response, "direct_passthrough", False):
+        return response
+    inner = response.response
+
+    def _close():
+        try:
+            if hasattr(inner, "close"):
+                inner.close()
+        finally:
+            response.response = ()  # 摘除 ClosingIterator，防止 close 递归
+            response.close()
+
+    response.response = ClosingIterator(inner, callbacks=[_close])
+    return response
 
 
 def normalize_device_identifier(raw: Optional[str], max_len: int = 120) -> str:
@@ -553,6 +591,42 @@ def create_app(
     for candidate in (lan_ip_candidates or []):
         if is_usable_ipv4(candidate):
             trusted_desktop_ips.add(str(candidate))
+
+    # 允许的浏览器 Origin：仅本机/本机局域网地址（含 localhost 与主机名），
+    # 用于拦截恶意网页对本服务的跨站请求（CSRF/CSWSH）。
+    http_port_int = int(http_port)
+    allowed_origins = {
+        f"http://127.0.0.1:{http_port_int}",
+        f"http://localhost:{http_port_int}",
+        f"http://[::1]:{http_port_int}",
+    }
+    for ip_text in [lan_ip, *list(lan_ip_candidates or [])]:
+        if is_usable_ipv4(ip_text):
+            allowed_origins.add(f"http://{ip_text}:{http_port_int}")
+    try:
+        hostname = socket.gethostname()
+        if hostname:
+            allowed_origins.add(f"http://{hostname}:{http_port_int}")
+    except OSError:
+        pass
+
+    @app.before_request
+    def guard_state_changing_origin():
+        # 服务端到服务端（urllib/requests）调用不携带 Origin，不受影响；
+        # 浏览器发起的写请求必须来自受信页面，否则拒绝。
+        is_ws_upgrade = request.headers.get("Upgrade", "").lower() == "websocket"
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") or is_ws_upgrade:
+            origin = request.headers.get("Origin") or request.headers.get("Sec-WebSocket-Origin")
+            if origin and origin not in allowed_origins:
+                _logger.warning(
+                    "Rejected %s request from untrusted origin %s (%s %s)",
+                    "WebSocket" if is_ws_upgrade else "state-changing",
+                    origin,
+                    request.method,
+                    request.path,
+                )
+                return jsonify({"error": "跨站请求被拒绝"}), 403
+
     peer_discovery_port = 54546
     runtime_settings = load_runtime_settings()
     configured_port = runtime_settings.get("peer_discovery_port")
@@ -621,6 +695,12 @@ def create_app(
     def history_connection() -> sqlite3.Connection:
         conn = sqlite3.connect(str(app.config["HISTORY_DB_PATH"]), timeout=15)
         conn.row_factory = sqlite3.Row
+        try:
+            # WAL 模式显著降低并发读写时的 "database is locked" 概率
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=15000")
+        except sqlite3.Error:
+            pass
         return conn
 
     def ensure_history_schema() -> None:
@@ -958,14 +1038,19 @@ def create_app(
         dynamic = 120 + int(safe_size / (256 * 1024))
         return max(120, min(1800, dynamic))
 
-    def check_peer_health(host: str, port: int) -> bool:
+    def check_peer_health(
+        host: str,
+        port: int,
+        attempts: int = 2,
+        timeout: tuple[float, float] = (1.5, 3.0),
+    ) -> bool:
         url = f"http://{host}:{int(port)}/health"
-        for attempt in range(2):
+        for attempt in range(attempts):
             try:
-                resp = requests.get(url, timeout=(1.5, 3.0))
+                resp = requests.get(url, timeout=timeout)
             except requests.RequestException as exc:
                 _logger.debug("health check attempt %d failed for %s:%d: %s", attempt + 1, host, port, exc)
-                if attempt < 1:
+                if attempt < attempts - 1:
                     time.sleep(random.uniform(0.2, 0.8))
                 continue
             if resp.status_code == 200:
@@ -1416,9 +1501,10 @@ def create_app(
 
     def persist_runtime_setting(key: str, value) -> None:
         try:
-            settings = load_runtime_settings()
-            settings[key] = value
-            save_runtime_settings(settings)
+            with _settings_lock:
+                settings = _read_settings_unlocked()
+                settings[key] = value
+                _write_settings_unlocked(settings)
         except Exception:
             _logger.warning("Failed to persist runtime setting '%s': skipping", key)
 
@@ -1479,6 +1565,48 @@ def create_app(
                 exc,
             )
 
+    MAX_CACHED_RECORDS = 1500
+
+    def cache_record(record: dict) -> None:
+        """登记记录到内存缓存；超过上限时淘汰最旧条目（历史记录以数据库为准）。"""
+        with lock:
+            records.append(record)
+            record_map[record["id"]] = record
+            while len(records) > MAX_CACHED_RECORDS:
+                oldest = records.pop(0)
+                record_map.pop(oldest["id"], None)
+
+    def cached_or_db_record(transfer_id: str) -> Optional[dict]:
+        """优先取内存缓存；缓存淘汰后从历史数据库回退构造记录（供下载/保存使用）。"""
+        with lock:
+            record = record_map.get(transfer_id)
+        if record is not None:
+            return record
+        row = history_row_by_id(transfer_id)
+        if row is None:
+            return None
+        path = Path(str(row["file_path"] or "")).expanduser()
+        if not path.is_absolute() or not path.exists():
+            return None
+        transient_dir = Path(app.config["TRANSIENT_UPLOAD_DIR"]).resolve()
+        try:
+            is_transient = path.resolve().parent == transient_dir
+        except OSError:
+            is_transient = False
+        return {
+            "id": transfer_id,
+            "name": str(row["file_name"]),
+            "size": int(row["file_size"] or 0),
+            "source": str(row["source"] or "mobile"),
+            "created_at": str(row["timestamp"]),
+            "path": path,
+            "transient": is_transient,
+            "device_id": str(row["device_id"]),
+            "device_name": str(row["device_name"]),
+            "direction": str(row["direction"]),
+            "status": str(row["status"]),
+        }
+
     def broadcast(event: dict, target_device_id: Optional[str] = None) -> None:
         payload = json.dumps(event, ensure_ascii=False)
         dead = []
@@ -1501,7 +1629,6 @@ def create_app(
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         announce_targets = infer_directed_broadcast_targets([lan_ip] + list(lan_ip_candidates or []))
-        last_tcp_probe_at = 0.0
         tcp_probe_interval = 8.0
         try:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1552,12 +1679,39 @@ def create_app(
                     if not is_usable_ipv4(neighbor_str):
                         continue
                     for scan_port in scan_ports:
-                        if check_peer_health(neighbor_str, scan_port):
+                        # 快速探测：单次尝试 + 短超时，避免黑名单/丢包网络下拖慢启动
+                        if check_peer_health(neighbor_str, scan_port, attempts=1, timeout=(0.6, 1.0)):
                             _logger.info("Startup neighbor scan found peer at %s:%d", neighbor_str, scan_port)
                             break
-                    time.sleep(0.05)  # Small delay to avoid flooding
+                    time.sleep(0.03)  # Small delay to avoid flooding
+
+            def _tcp_probe_loop() -> None:
+                """周期 TCP 探活已配对设备；独立线程，避免阻塞 UDP 广播循环。"""
+                while True:
+                    time.sleep(tcp_probe_interval)
+                    now = time.time()
+                    with lock:
+                        tcp_probe_targets = [
+                            (peer_id, str(peer.get("host", "").strip()), int(peer.get("port", 0)))
+                            for peer_id, peer in paired_desktops.items()
+                            if str(peer.get("host", "").strip()) and int(peer.get("port", 0)) > 0
+                        ]
+                    for peer_id, peer_host, peer_port in tcp_probe_targets:
+                        if check_peer_health(peer_host, peer_port):
+                            with lock:
+                                peer = paired_desktops.get(peer_id)
+                                if peer is not None:
+                                    refresh_discovered_from_peer_locked(
+                                        peer_id,
+                                        str(peer.get("device_name", f"电脑-{peer_id[:8]}")),
+                                        peer_host,
+                                        peer_port,
+                                        seen_at=now,
+                                    )
+                            _logger.debug("TCP probe succeeded for paired device %s at %s:%d", peer_id, peer_host, peer_port)
 
             threading.Thread(target=_startup_neighbor_scan, daemon=True, name="lft-startup-scan").start()
+            threading.Thread(target=_tcp_probe_loop, daemon=True, name="lft-tcp-probe").start()
 
             next_announce_at = 0.0
             while True:
@@ -1582,28 +1736,6 @@ def create_app(
                                 exc,
                             )
                     next_announce_at = now + peer_announce_interval
-
-                if now - last_tcp_probe_at >= tcp_probe_interval:
-                    with lock:
-                        tcp_probe_targets = [
-                            (peer_id, str(peer.get("host", "").strip()), int(peer.get("port", 0)))
-                            for peer_id, peer in paired_desktops.items()
-                            if str(peer.get("host", "").strip()) and int(peer.get("port", 0)) > 0
-                        ]
-                    for peer_id, peer_host, peer_port in tcp_probe_targets:
-                        if check_peer_health(peer_host, peer_port):
-                            with lock:
-                                peer = paired_desktops.get(peer_id)
-                                if peer is not None:
-                                    refresh_discovered_from_peer_locked(
-                                        peer_id,
-                                        str(peer.get("device_name", f"电脑-{peer_id[:8]}")),
-                                        peer_host,
-                                        peer_port,
-                                        seen_at=now,
-                                    )
-                            _logger.debug("TCP probe succeeded for paired device %s at %s:%d", peer_id, peer_host, peer_port)
-                    last_tcp_probe_at = now
 
                 wait_seconds = max(0.2, min(1.0, next_announce_at - now))
                 listener.settimeout(wait_seconds)
@@ -2116,15 +2248,35 @@ def create_app(
         auto_accept = False
         request_snapshot = {}
         with lock:
-            refresh_discovered_from_peer_locked(from_device_id, from_device_name, from_host, from_port, seen_at=time.time())
             existing_pair = paired_desktops.get(from_device_id)
+            # 校验必须先于 refresh_discovered_from_peer_locked：
+            # 发现记录会被请求方来源 IP 覆盖，若先 refresh 再校验，校验恒成立，防劫持失效。
+            known_hosts = set()
             if existing_pair is not None:
+                known_hosts.add(str(existing_pair.get("host") or "").strip())
+            discovered_before = discovered_desktops.get(from_device_id)
+            if discovered_before is not None and str(discovered_before.get("host") or "").strip():
+                known_hosts.add(str(discovered_before["host"]).strip())
+
+            if existing_pair is not None and from_host in known_hosts:
+                # 来源一致：正常续约，自动接受并刷新发现记录
                 existing_pair["device_name"] = from_device_name
                 existing_pair["host"] = from_host
                 existing_pair["port"] = from_port
                 existing_pair["last_seen_at"] = int(time.time())
+                refresh_discovered_from_peer_locked(from_device_id, from_device_name, from_host, from_port, seen_at=time.time())
                 auto_accept = True
             else:
+                if existing_pair is not None:
+                    _logger.warning(
+                        "Pair request from %s for already-paired device %s: host mismatch (known %s), requiring manual approval",
+                        from_host,
+                        from_device_id,
+                        sorted(known_hosts) if known_hosts else "(none)",
+                    )
+                else:
+                    # 新设备配对：来源 IP 为真实 socket 地址，可刷新发现记录
+                    refresh_discovered_from_peer_locked(from_device_id, from_device_name, from_host, from_port, seen_at=time.time())
                 pending_pair_requests[request_id] = {
                     "request_id": request_id,
                     "from_device_id": from_device_id,
@@ -2458,36 +2610,36 @@ def create_app(
         with lock:
             peer = paired_desktops.get(source_peer_device_id)
             if peer is None:
+                # 仅允许“来源 IP 与某条配对记录一致”时按新设备 ID 归并（同一台机器换 ID/多实例场景）。
+                # 不再按设备名匹配：设备名可伪造，防止攻击者顶替已有配对条目。
                 same_host_peers = [
                     (peer_id, peer_item)
                     for peer_id, peer_item in paired_desktops.items()
                     if str(peer_item.get("host") or "") == remote_ip
                 ]
-                chosen: Optional[tuple[str, dict]] = None
                 if same_host_peers:
-                    name_matched = [
-                        item
-                        for item in same_host_peers
-                        if normalize_peer_name(item[1].get("device_name"), fallback="") == source_peer_name_hint
-                    ]
-                    pool = name_matched if name_matched else same_host_peers
-                    chosen = max(pool, key=lambda item: int(item[1].get("paired_at") or 0))
-                elif paired_desktops:
-                    name_candidates = [
-                        (peer_id, peer_item)
-                        for peer_id, peer_item in paired_desktops.items()
-                        if normalize_peer_name(peer_item.get("device_name"), fallback="") == source_peer_name_hint
-                    ]
-                    if len(name_candidates) == 1:
-                        chosen = name_candidates[0]
-
-                if chosen is not None:
+                    chosen = max(same_host_peers, key=lambda item: int(item[1].get("paired_at") or 0))
                     old_peer_id, old_peer = chosen
                     paired_desktops.pop(old_peer_id, None)
                     paired_desktops[source_peer_device_id] = old_peer
                     peer = old_peer
                 else:
                     return jsonify({"error": "未配对设备，拒绝接收文件"}), 403
+            else:
+                # 来源校验：远端 IP 必须与配对记录或最近发现记录一致，
+                # 防止局域网内其他设备伪造 X-Peer-Device-Id 向本机推送文件。
+                known_hosts = {str(peer.get("host") or "").strip()}
+                discovered = discovered_desktops.get(source_peer_device_id)
+                if discovered is not None and str(discovered.get("host") or "").strip():
+                    known_hosts.add(str(discovered["host"]).strip())
+                if remote_ip not in known_hosts:
+                    _logger.warning(
+                        "Rejected peer upload: device %s claimed from %s, known hosts %s",
+                        source_peer_device_id,
+                        remote_ip,
+                        sorted(known_hosts),
+                    )
+                    return jsonify({"error": "设备来源地址与配对记录不一致，请重新配对后重试"}), 403
             peer_name = normalize_peer_name(
                 source_peer_name_header,
                 fallback=str(peer.get("device_name") or f"电脑-{source_peer_device_id[:8]}"),
@@ -2547,9 +2699,7 @@ def create_app(
             "status": "成功",
         }
 
-        with lock:
-            records.append(record)
-            record_map[transfer_id] = record
+        cache_record(record)
 
         try:
             insert_history_record(
@@ -2647,9 +2797,7 @@ def create_app(
             "status": "成功",
         }
 
-        with lock:
-            records.append(record)
-            record_map[transfer_id] = record
+        cache_record(record)
 
         try:
             insert_history_record(
@@ -2706,8 +2854,6 @@ def create_app(
             safe_name = sanitize_filename_for_windows(original_name)
             saved_name = f"{int(time.time())}_{transfer_id}_{safe_name}"
             target_dir = app.config["TRANSIENT_UPLOAD_DIR"]
-            destination = target_dir / saved_name
-            stored_name = original_name
         else:
             target_dir = Path(app.config["DOWNLOAD_DIR"]).resolve()
             try:
@@ -2715,8 +2861,12 @@ def create_app(
             except Exception as exc:
                 return jsonify({"error": f"保存目录不可用: {exc}"}), 500
         with file_lock:
-            destination = allocate_unique_file_path(target_dir, original_name, reserve=True)
-        stored_name = destination.name
+            if is_transient:
+                # 瞬态文件使用“时间戳+ID+原名”唯一前缀落盘，避免与真实下载目录重名混淆
+                destination = allocate_unique_file_path(target_dir, saved_name, reserve=True)
+            else:
+                destination = allocate_unique_file_path(target_dir, original_name, reserve=True)
+        stored_name = original_name if is_transient else destination.name
 
         max_upload_bytes_local = app.config["MAX_UPLOAD_BYTES"]
         content_len = request.content_length
@@ -2783,9 +2933,7 @@ def create_app(
             "status": "成功",
         }
 
-        with lock:
-            records.append(record)
-            record_map[transfer_id] = record
+        cache_record(record)
 
         try:
             insert_history_record(
@@ -2816,9 +2964,7 @@ def create_app(
         if not authorize_request():
             return jsonify({"error": "未授权访问"}), 401
 
-        with lock:
-            record = record_map.get(transfer_id)
-
+        record = cached_or_db_record(transfer_id)
         if record is None:
             return jsonify({"error": "文件不存在"}), 404
         if not is_trusted_desktop(request.remote_addr):
@@ -2832,20 +2978,28 @@ def create_app(
             req_device_id = DESKTOP_DEVICE_ID
 
         try:
-            update_history_status(transfer_id, "已下载")
+            response = send_file(
+                record["path"],
+                as_attachment=True,
+                download_name=record["name"],
+                conditional=True,
+            )
+        except Exception as exc:
+            return jsonify({"error": f"文件不可用: {exc}"}), 404
+
+        def _mark_downloaded() -> None:
+            # 响应真正完成后才标记“已下载”，避免中断/失败的下载被记为成功
+            try:
+                update_history_status(transfer_id, "已下载")
+            except Exception:
+                pass
             with lock:
                 active = record_map.get(transfer_id)
                 if active is not None:
                     active["status"] = "已下载"
-        except Exception as exc:
-            return jsonify({"error": f"写入历史记录失败: {exc}"}), 500
+            send_history_update_event(transfer_id, target_device_id=req_device_id)
 
-        response = send_file(
-            record["path"],
-            as_attachment=True,
-            download_name=record["name"],
-            conditional=True,
-        )
+        response.call_on_close(_mark_downloaded)
         if record.get("transient"):
             source_resolved = Path(record["path"]).resolve()
             response.call_on_close(
@@ -2856,17 +3010,14 @@ def create_app(
                     keep_source_when_same=False,
                 )
             )
-        send_history_update_event(transfer_id, target_device_id=req_device_id)
-        return response
+        return attach_response_close_hooks(response)
 
     @app.post("/files/<transfer_id>/save")
     def save_file_to_download_dir(transfer_id: str):
         if not authorize_request():
             return jsonify({"error": "未授权访问"}), 401
 
-        with lock:
-            record = record_map.get(transfer_id)
-
+        record = cached_or_db_record(transfer_id)
         if record is None:
             return jsonify({"error": "文件不存在"}), 404
 
@@ -2963,6 +3114,12 @@ def create_app(
 
     @sock.route("/ws")
     def ws_handler(ws):
+        # CSWSH 防护：非浏览器客户端（无 Origin）放行；浏览器必须来自受信页面
+        origin = request.headers.get("Origin") or request.headers.get("Sec-WebSocket-Origin")
+        if origin and origin not in allowed_origins:
+            _logger.warning("WS connection from untrusted origin %s rejected", origin)
+            ws.close()
+            return
         if not authorize_request(allow_query_session=True):
             ws.close()
             return
@@ -3027,7 +3184,8 @@ def start_server(
         print(f"Port {port} is occupied, switched to {selected_port}")
 
     lan_ip_candidates = get_lan_ipv4_candidates()
-    lan_ip = lan_ip_candidates[0] if lan_ip_candidates else "127.0.0.1"
+    # 优先使用用户在设置中选择的局域网 IP；未选择或已失效时回退候选列表第一个
+    lan_ip = get_selected_lan_ip(lan_ip_candidates) or (lan_ip_candidates[0] if lan_ip_candidates else "127.0.0.1")
     base_url = f"http://{lan_ip}:{selected_port}"
     initial_mobile_token = uuid.uuid4().hex
     mobile_url = f"{base_url}/?token={initial_mobile_token}"
