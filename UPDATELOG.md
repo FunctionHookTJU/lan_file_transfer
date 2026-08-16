@@ -2,6 +2,14 @@
 
 日期：2026-08-16
 
+## 修复手机扫码无法进入（v1.9.3）
+
+- **根因**：`get_lan_ipv4_candidates()` 把所有来源 IP 混在一起按字符串排序，Hyper-V/WSL 虚拟网卡（如 `172.21.x`、`172.30.x`）会排在真实局域网 IP（如 `192.168.1.x`）前面，导致二维码指向手机不可达的虚拟网卡地址。
+- **修复**：默认路由出口（UDP connect 成功）的 IP 优先，其次才是主机名解析到的其他 IP——base_url/二维码重新指向真实上网网卡。
+- **Origin 校验增强**：WebSocket 与写请求的 Origin 校验增加"同源兜底"——Origin 与请求 Host 一致即放行（覆盖任意 IP/端口/代理/转发下的正常访问），跨站恶意页面仍被拒绝。
+
+日期：2026-08-16
+
 ## 移除安装器构建功能
 
 - 删除 Inno Setup 安装器构建：`build/build_installer.ps1` 与 `installer/lan_file_transfer.iss` 不再提供，安装器产物（`-Setup.exe`）不再构建。

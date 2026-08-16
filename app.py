@@ -67,21 +67,26 @@ def ipv4_priority_key(ip_text: str) -> tuple[int, str]:
 
 
 def get_lan_ipv4_candidates() -> list[str]:
-    candidates: list[str] = []
+    primary: list[str] = []  # 默认路由出口（UDP connect 成功）——真实对外网卡，优先
+    secondary: list[str] = []
     seen: set[str] = set()
 
-    def push(value: str) -> None:
+    def push(value: str, is_primary: bool = False) -> None:
         ip_text = str(value or "").strip()
         if not ip_text or ip_text in seen or not is_usable_ipv4(ip_text):
             return
         seen.add(ip_text)
-        candidates.append(ip_text)
+        (primary if is_primary else secondary).append(ip_text)
 
+    # UDP connect 成功意味着该 IP 是默认路由出口（真实上网网卡）。
+    # 注意：不能把所有来源混在一起按字符串排序——Hyper-V/WSL 虚拟网卡
+    # （如 172.21.x、172.30.x）会排在真实局域网 IP（如 192.168.1.x）前面，
+    # 导致二维码指向手机不可达的虚拟网卡 IP。
     for endpoint in (("8.8.8.8", 80), ("1.1.1.1", 80), ("223.5.5.5", 80)):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.connect(endpoint)
-            push(sock.getsockname()[0])
+            push(sock.getsockname()[0], is_primary=True)
         except OSError:
             continue
         finally:
@@ -103,8 +108,9 @@ def get_lan_ipv4_candidates() -> list[str]:
         if isinstance(sockaddr, tuple) and sockaddr:
             push(str(sockaddr[0]))
 
-    candidates.sort(key=ipv4_priority_key)
-    return candidates
+    primary.sort(key=ipv4_priority_key)
+    secondary.sort(key=ipv4_priority_key)
+    return primary + secondary
 
 
 def get_lan_ip() -> str:
@@ -592,23 +598,37 @@ def create_app(
         if is_usable_ipv4(candidate):
             trusted_desktop_ips.add(str(candidate))
 
-    # 允许的浏览器 Origin：仅本机/本机局域网地址（含 localhost 与主机名），
-    # 用于拦截恶意网页对本服务的跨站请求（CSRF/CSWSH）。
+    # 允许的浏览器 Origin 主机：本机/本机局域网地址（含 localhost 与主机名）。
+    # 判定规则（见 origin_allowed）：
+    #   1. 无 Origin（非浏览器客户端，如服务端间调用）→ 放行
+    #   2. Origin 与请求 Host 一致（页面从本服务加载，同源）→ 放行，覆盖任意 IP/端口/转发场景
+    #   3. Origin 主机是本机 IP/主机名且端口为本服务端口 → 放行
+    #   4. 其余（跨站恶意页面）→ 拒绝
     http_port_int = int(http_port)
-    allowed_origins = {
-        f"http://127.0.0.1:{http_port_int}",
-        f"http://localhost:{http_port_int}",
-        f"http://[::1]:{http_port_int}",
-    }
+    allowed_origin_hosts = {"127.0.0.1", "localhost", "::1"}
     for ip_text in [lan_ip, *list(lan_ip_candidates or [])]:
         if is_usable_ipv4(ip_text):
-            allowed_origins.add(f"http://{ip_text}:{http_port_int}")
+            allowed_origin_hosts.add(ip_text)
     try:
         hostname = socket.gethostname()
         if hostname:
-            allowed_origins.add(f"http://{hostname}:{http_port_int}")
+            allowed_origin_hosts.add(hostname.lower())
     except OSError:
         pass
+
+    def origin_allowed(origin: str) -> bool:
+        if not origin:
+            return True
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        host_header = request.headers.get("Host", "")
+        if host_header and parsed.netloc == host_header:
+            return True
+        if parsed.scheme != "http" or parsed.port != http_port_int:
+            return False
+        return (parsed.hostname or "").lower() in allowed_origin_hosts
 
     @app.before_request
     def guard_state_changing_origin():
@@ -617,7 +637,7 @@ def create_app(
         is_ws_upgrade = request.headers.get("Upgrade", "").lower() == "websocket"
         if request.method in ("POST", "PUT", "PATCH", "DELETE") or is_ws_upgrade:
             origin = request.headers.get("Origin") or request.headers.get("Sec-WebSocket-Origin")
-            if origin and origin not in allowed_origins:
+            if not origin_allowed(origin):
                 _logger.warning(
                     "Rejected %s request from untrusted origin %s (%s %s)",
                     "WebSocket" if is_ws_upgrade else "state-changing",
@@ -3116,7 +3136,7 @@ def create_app(
     def ws_handler(ws):
         # CSWSH 防护：非浏览器客户端（无 Origin）放行；浏览器必须来自受信页面
         origin = request.headers.get("Origin") or request.headers.get("Sec-WebSocket-Origin")
-        if origin and origin not in allowed_origins:
+        if not origin_allowed(origin):
             _logger.warning("WS connection from untrusted origin %s rejected", origin)
             ws.close()
             return

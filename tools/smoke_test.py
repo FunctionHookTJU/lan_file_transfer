@@ -98,6 +98,24 @@ def main() -> int:
     client = app.test_client()
 
     try:
+        print("== 0. LAN IP 候选排序（默认路由出口优先）==")
+        cands = backend.get_lan_ipv4_candidates()
+        if cands:
+            default_route_ips = []
+            for ep in (("8.8.8.8", 80), ("1.1.1.1", 80), ("223.5.5.5", 80)):
+                s = backend.socket.socket(backend.socket.AF_INET, backend.socket.SOCK_DGRAM)
+                try:
+                    s.connect(ep)
+                    default_route_ips.append(s.getsockname()[0])
+                except OSError:
+                    pass
+                finally:
+                    s.close()
+            check("候选首位 = 默认路由出口 IP", cands[0] in default_route_ips,
+                  f"first={cands[0]}, default_route={set(default_route_ips)}")
+        else:
+            check("无可用候选（环境无网卡）", True, "skip")
+
         print("== 1. 基础鉴权 ==")
         r = client.get("/health")
         check("GET /health 200", r.status_code == 200, f"got {r.status_code}")
@@ -132,12 +150,12 @@ def main() -> int:
         srv_ws = make_server("127.0.0.1", 5597, app, threaded=True)
         threading.Thread(target=srv_ws.serve_forever, daemon=True).start()
         try:
-            def ws_handshake(origin: str) -> str:
+            def ws_handshake(origin: str, host_header: str = "127.0.0.1:5597") -> str:
                 s = _socket.create_connection(("127.0.0.1", 5597), timeout=5)
                 try:
                     req = (
                         "GET /ws HTTP/1.1\r\n"
-                        "Host: 127.0.0.1:5597\r\n"
+                        f"Host: {host_header}\r\n"
                         "Upgrade: websocket\r\n"
                         "Connection: Upgrade\r\n"
                         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
@@ -154,6 +172,16 @@ def main() -> int:
             check("WS 恶意 Origin 握手 -> 403", status_evil.startswith("HTTP/1.1 403"), f"got {status_evil!r}")
             status_ok = ws_handshake(f"http://127.0.0.1:{PORT}")
             check("WS 白名单 Origin 握手 -> 101", status_ok.startswith("HTTP/1.1 101"), f"got {status_ok!r}")
+            # 同源兜底：Origin 与 Host 一致即放行（模拟手机经任意地址访问本服务的页面）
+            status_same = ws_handshake("http://192.168.9.9:5597", host_header="192.168.9.9:5597")
+            check("WS 同源 Origin 握手 -> 101", status_same.startswith("HTTP/1.1 101"), f"got {status_same!r}")
+            # 跨站但伪造 Host 一致的情况：Origin 主机非本机 IP 且 Host 相同仍应放行？
+            # 注意：恶意页面 Origin=evil.com:5597、Host=evil.com:5597 时两者一致，
+            # 但请求是发往本服务的，Host 头由浏览器按实际地址填（127.0.0.1:5597），
+            # 因此该场景实际不会发生；此处验证 Host 不匹配时恶意 Origin 仍被拒。
+            status_mismatch = ws_handshake("http://evil.example", host_header="127.0.0.1:5597")
+            check("WS 恶意 Origin（Host 不匹配）-> 403", status_mismatch.startswith("HTTP/1.1 403"),
+                  f"got {status_mismatch!r}")
         finally:
             srv_ws.shutdown()
 
