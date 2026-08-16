@@ -324,6 +324,11 @@ def main() -> int:
             persisted = _read()
             check("selected_lan_ip 已持久化", persisted.get("selected_lan_ip") == chosen,
                   f"settings={persisted}")
+            r = client.post("/settings/lan-ip", json={"selected_ip": "auto"})
+            body = r.get_json(silent=True) or {}
+            persisted = _read()
+            check("auto 恢复自动选择", r.status_code == 200 and "selected_lan_ip" not in persisted,
+                  f"got {r.status_code} settings={persisted}")
         else:
             r = client.post("/settings/lan-ip", json={"selected_ip": "127.0.0.1"})
             check("无候选时选择 loopback -> 400（行为正确）", r.status_code == 400, f"got {r.status_code}")

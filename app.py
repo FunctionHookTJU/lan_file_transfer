@@ -2532,8 +2532,17 @@ def create_app(
 
         payload = request.get_json(silent=True) or {}
         raw_ip = str(payload.get("selected_ip", "")).strip()
-        if not raw_ip:
-            return jsonify({"error": "缺少 selected_ip"}), 400
+        if raw_ip in ("", "auto"):
+            # 恢复自动选择：删除已保存的手动选择，重启后按默认路由出口自动挑选
+            try:
+                with _settings_lock:
+                    settings = _read_settings_unlocked()
+                    settings.pop("selected_lan_ip", None)
+                    _write_settings_unlocked(settings)
+            except Exception as exc:
+                return jsonify({"error": f"保存失败: {exc}"}), 500
+            _logger.info("用户恢复局域网 IP 自动选择（需重启生效）")
+            return jsonify({"ok": True, "selected_ip": "", "note": "已恢复自动选择，重启服务后生效"})
 
         candidates = get_lan_ipv4_candidates()
         if raw_ip not in candidates:

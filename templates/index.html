@@ -2372,12 +2372,18 @@
         if (!resp.ok) return;
         const data = await resp.json();
         const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+        const hasManual = !!data.selected_ip && candidates.includes(data.selected_ip);
         ui.lanIpSelect.innerHTML = '';
+        const autoOpt = document.createElement('option');
+        autoOpt.value = 'auto';
+        autoOpt.textContent = '自动选择（推荐）' + (hasManual ? '' : '（当前）');
+        ui.lanIpSelect.appendChild(autoOpt);
         if (candidates.length === 0) {
           const opt = document.createElement('option');
           opt.value = '';
           opt.textContent = '未检测到可用 IP';
           ui.lanIpSelect.appendChild(opt);
+          ui.lanIpSelect.value = 'auto';
           return;
         }
         for (const ip of candidates) {
@@ -2386,9 +2392,7 @@
           opt.textContent = ip + (ip === data.current_ip ? '（当前）' : '');
           ui.lanIpSelect.appendChild(opt);
         }
-        if (data.current_ip && candidates.includes(data.current_ip)) {
-          ui.lanIpSelect.value = data.current_ip;
-        }
+        ui.lanIpSelect.value = hasManual ? data.selected_ip : 'auto';
       } catch (_) {
       }
     }
@@ -2410,7 +2414,7 @@
         });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || `保存失败(${resp.status})`);
-        showToast('局域网 IP 已保存，重启服务后生效');
+        showToast(selected === 'auto' ? '已恢复自动选择，重启服务后生效' : '局域网 IP 已保存，重启服务后生效');
       } catch (err) {
         console.error(err);
         showToast('保存失败：' + (err.message || '未知错误'));
