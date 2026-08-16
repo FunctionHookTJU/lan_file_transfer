@@ -1,5 +1,40 @@
 # 更新日志
 
+日期：2026-08-16
+
+## 移除安装器构建功能
+
+- 删除 Inno Setup 安装器构建：`build/build_installer.ps1` 与 `installer/lan_file_transfer.iss` 不再提供，安装器产物（`-Setup.exe`）不再构建。
+- `build/build_all.ps1` 一键构建仅产出 `dist\LANFileTransfer.exe` 与 `dist\LANFileTransfer-v<版本号>.exe`。
+- README 已同步：仅保留"打包 EXE"与"一键构建"两个方案。
+- 分发方式：直接分发单个托盘 EXE（`LANFileTransfer.exe`）。
+
+日期：2026-08-16
+
+## 安全加固与稳定性修复（v1.9.2）
+
+- **跨站防护（CSRF/CSWSH）**：新增 Origin 白名单——所有写请求与 WebSocket 升级请求在握手前校验 Origin，非本机页面发起的请求直接 403；WS 处理器内二次校验。
+- **`/peer/upload` 来源校验**：接收端校验请求方 IP 必须与配对记录/最近发现记录一致，拒绝伪造 `X-Peer-Device-Id` 推送文件；移除可按设备名顶替配对条目的迁移逻辑。
+- **配对 auto-accept 防劫持**：`/pairing/request` 仅当请求来源 IP 与配对记录/发现记录一致时才自动接受，否则转入人工确认流程（设备 ID 经 UDP/mDNS 公开，仅凭 ID 不能证明身份）。
+- **修复 LAN IP 手动选择失效**：`start_server` 启动时应用用户保存的 `selected_lan_ip`（此前接口有保存但启动路径未消费）；设置面板新增“局域网 IP”下拉选择器（重启生效）。
+- **修复瞬态文件清理根因**：`send_file` 返回的响应为 `direct_passthrough` 模式，`call_on_close` 回调（下载后清理瞬态文件/标记已下载）此前从未执行；现通过 `attach_response_close_hooks` 包装 `ClosingIterator` 保证响应结束后触发。
+- **修复 `/upload` 瞬态路径死代码**：唯一前缀名（时间戳+ID+原名）此前被覆盖未生效，现按前缀落盘，避免与真实下载目录重名混淆。
+- **内存有界**：`records`/`record_map` 缓存上限 1500 条，超出自动淘汰最旧；下载/保存接口支持从历史数据库回退，长运行不再无界增长。
+- **发现线程解耦**：TCP 探活移入独立线程，UDP 广播循环不再被健康检查阻塞；启动邻居扫描改为单次快速探测（0.6s/1.0s）。
+- **数据库与配置可靠性**：历史库启用 WAL + busy_timeout，降低并发 "database is locked" 概率；`settings.json` 读-改-写加锁，避免并发持久化互相覆盖。
+- **下载状态语义修正**：`/files/<id>` 在响应真正完成后才标记“已下载”，中断/失败的下载不再记为成功。
+- 新增回归测试：`tools/smoke_test.py`（35 项断言，覆盖鉴权、Origin 防护、配对校验、瞬态清理、会话上传等）。
+
+日期：2026-06-06
+
+## 局域网发现可靠性 & 速度优化（v1.9.1）
+
+- 子网掩码真值检测：通过 iphlpapi（Win）/ ioctl（Linux）获取实际子网广播地址，替代硬编码 /24 推导，非标准子网也能正确广播。
+- mDNS/Zeroconf 并行发现：UDP 广播被阻断时仍可通过 mDNS 互相发现。
+- 并行端口探测：`find_reachable_paired_peer` 内 60+ 端口改为 ThreadPoolExecutor 分批并行探活（batch=10, max_workers=8），可达性检测提速 3-5x。
+- 启动即时发现：启动时立即发送 UDP 广播 + TCP 邻居扫描（本机 ±15 IP 范围），秒级初始发现。
+- 中继重试流校验 fail-fast：重试时如文件大小不匹配直接返回错误，不再静默跳过。
+
 日期：2026-03-26
 
 ## 调试模式与构建选项

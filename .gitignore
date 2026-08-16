@@ -17,6 +17,7 @@ ENV/
 .coverage
 .coverage.*
 htmlcov/
+.omo/
 
 # IDE/editor files
 .idea/
@@ -45,10 +46,4 @@ dist/
 *.pkg
 *.toc
 *.pyz
-
-# Installer output artifacts
-installer/Output/
-installer/build/
-installer/dist/
-*.msi
 .aider*

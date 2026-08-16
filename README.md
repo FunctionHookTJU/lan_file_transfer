@@ -69,33 +69,6 @@ python tray_app.py --port 5000 --debug
 
 - `dist\LANFileTransfer.exe`（托盘化、双击即用）
 
-## 方案 2：安装器（Inno Setup）
-
-先安装 Inno Setup 6，然后执行：
-
-```powershell
-.\build\build_installer.ps1
-```
-
-产物：
-
-- `dist\LANFileTransfer-Setup.exe`
-
-安装器功能：
-
-- 安装到 `AppData\Local\Programs\LAN 文件传输`
-- 开始菜单快捷方式
-- 可选桌面快捷方式
-- 可选开机启动
-
-## 方案 3：EXE + 安装器 + 托盘化
-
-本仓库已完整支持该组合方案：
-
-1. `build_exe.ps1` 生成托盘 EXE
-2. `build_installer.ps1` 打包安装器
-3. 用户安装后通过快捷方式启动，程序常驻托盘
-
 ## 一键构建（推荐）
 
 ```powershell
@@ -117,7 +90,7 @@ build\build_all.bat
 产物：
 
 - `dist\LANFileTransfer.exe`
-- `dist\LANFileTransfer-v<版本号>-Setup.exe`
+- `dist\LANFileTransfer-v<版本号>.exe`
 
 ## 大文件内存占用处理
 
