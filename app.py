@@ -92,6 +92,13 @@ def get_lan_ipv4_candidates() -> list[str]:
         finally:
             sock.close()
 
+    # 兜底：无外网（UDP connect 全部失败）时，用"存在真实网关"识别真实局域网网卡。
+    # Hyper-V/WSL 虚拟网卡的网关通常为 0.0.0.0，不会进入 primary。
+    if sys.platform.startswith("win"):
+        for ip_str, _mask, _bcast, gateway in _windows_adapters():
+            if gateway:
+                push(ip_str, is_primary=True)
+
     try:
         host_ips = socket.gethostbyname_ex(socket.gethostname())[2]
     except OSError:
@@ -134,117 +141,128 @@ def get_selected_lan_ip(candidates: list[str]) -> Optional[str]:
     return None
 
 
-def get_interface_subnet_info() -> list[tuple[str, str, str]]:
-    """Returns list of (ip_address, subnet_mask, broadcast_address) tuples from actual OS network config."""
-    results: list[tuple[str, str, str]] = []
-    if sys.platform.startswith("win"):
-        try:
-            # Windows: use iphlpapi.GetAdaptersInfo
-            MAX_ADAPTER_NAME_LENGTH = 256
-            MAX_ADAPTER_DESCRIPTION_LENGTH = 128
-            MAX_ADAPTER_ADDRESS_LENGTH = 8
+def _windows_adapters() -> list[tuple[str, str, str, str]]:
+    """Windows: 通过 iphlpapi.GetAdaptersInfo 解析网卡 (ip, mask, broadcast, gateway)。"""
+    results: list[tuple[str, str, str, str]] = []
+    if not sys.platform.startswith("win"):
+        return results
+    try:
+        MAX_ADAPTER_NAME_LENGTH = 256
+        MAX_ADAPTER_DESCRIPTION_LENGTH = 128
+        MAX_ADAPTER_ADDRESS_LENGTH = 8
 
-            class _IP_ADDR_STRING(ctypes.Structure):
-                pass
+        class _IP_ADDR_STRING(ctypes.Structure):
+            pass
 
-            _IP_ADDR_STRING._fields_ = [
-                ("Next", ctypes.POINTER(_IP_ADDR_STRING)),
-                ("IpAddress", ctypes.c_char * 16),
-                ("IpMask", ctypes.c_char * 16),
-                ("Context", wintypes.DWORD),
-            ]
+        _IP_ADDR_STRING._fields_ = [
+            ("Next", ctypes.POINTER(_IP_ADDR_STRING)),
+            ("IpAddress", ctypes.c_char * 16),
+            ("IpMask", ctypes.c_char * 16),
+            ("Context", wintypes.DWORD),
+        ]
 
-            class _IP_ADAPTER_INFO(ctypes.Structure):
-                pass
+        class _IP_ADAPTER_INFO(ctypes.Structure):
+            pass
 
-            _IP_ADAPTER_INFO._fields_ = [
-                ("Next", ctypes.POINTER(_IP_ADAPTER_INFO)),
-                ("ComboIndex", wintypes.DWORD),
-                ("AdapterName", ctypes.c_char * (MAX_ADAPTER_NAME_LENGTH + 4)),
-                ("Description", ctypes.c_char * (MAX_ADAPTER_DESCRIPTION_LENGTH + 4)),
-                ("AddressLength", wintypes.UINT),
-                ("Address", ctypes.c_ubyte * MAX_ADAPTER_ADDRESS_LENGTH),
-                ("Index", wintypes.DWORD),
-                ("Type", wintypes.UINT),
-                ("DhcpEnabled", wintypes.UINT),
-                ("CurrentIpAddress", ctypes.POINTER(_IP_ADDR_STRING)),
-                ("IpAddressList", _IP_ADDR_STRING),
-                ("GatewayList", _IP_ADDR_STRING),
-                ("DhcpServer", _IP_ADDR_STRING),
-                ("HaveWins", wintypes.BOOL),
-                ("PrimaryWinsServer", _IP_ADDR_STRING),
-                ("SecondaryWinsServer", _IP_ADDR_STRING),
-                ("LeaseObtained", wintypes.DWORD),
-                ("LeaseExpires", wintypes.DWORD),
-            ]
+        _IP_ADAPTER_INFO._fields_ = [
+            ("Next", ctypes.POINTER(_IP_ADAPTER_INFO)),
+            ("ComboIndex", wintypes.DWORD),
+            ("AdapterName", ctypes.c_char * (MAX_ADAPTER_NAME_LENGTH + 4)),
+            ("Description", ctypes.c_char * (MAX_ADAPTER_DESCRIPTION_LENGTH + 4)),
+            ("AddressLength", wintypes.UINT),
+            ("Address", ctypes.c_ubyte * MAX_ADAPTER_ADDRESS_LENGTH),
+            ("Index", wintypes.DWORD),
+            ("Type", wintypes.UINT),
+            ("DhcpEnabled", wintypes.UINT),
+            ("CurrentIpAddress", ctypes.POINTER(_IP_ADDR_STRING)),
+            ("IpAddressList", _IP_ADDR_STRING),
+            ("GatewayList", _IP_ADDR_STRING),
+            ("DhcpServer", _IP_ADDR_STRING),
+            ("HaveWins", wintypes.BOOL),
+            ("PrimaryWinsServer", _IP_ADDR_STRING),
+            ("SecondaryWinsServer", _IP_ADDR_STRING),
+            ("LeaseObtained", wintypes.DWORD),
+            ("LeaseExpires", wintypes.DWORD),
+        ]
 
-            iphlpapi = ctypes.windll.iphlpapi
-            size = wintypes.ULONG(0)
-            ret = iphlpapi.GetAdaptersInfo(None, ctypes.byref(size))
-            if ret == 111:  # ERROR_BUFFER_OVERFLOW
-                buffer = ctypes.create_string_buffer(size.value)
-                adapter_ptr = ctypes.cast(buffer, ctypes.POINTER(_IP_ADAPTER_INFO))
-                ret = iphlpapi.GetAdaptersInfo(adapter_ptr, ctypes.byref(size))
-                if ret == 0:  # NO_ERROR
-                    current = adapter_ptr
-                    while current:
-                        addr = current.contents.IpAddressList
-                        while True:
-                            ip_str = addr.IpAddress.decode("ascii", errors="ignore").strip("\x00")
-                            mask_str = addr.IpMask.decode("ascii", errors="ignore").strip("\x00")
-                            if ip_str and mask_str and ip_str != "0.0.0.0":
-                                try:
-                                    ip_obj = ipaddress.ip_address(ip_str)
-                                    mask_obj = ipaddress.ip_address(mask_str)
-                                    if ip_obj.version == 4 and mask_obj.version == 4:
-                                        # Calculate prefix length from mask
-                                        mask_int = int(mask_obj)
-                                        prefix_len = bin(mask_int).count("1")
-                                        network = ipaddress.ip_network(f"{ip_str}/{prefix_len}", strict=False)
-                                        results.append((ip_str, mask_str, str(network.broadcast_address)))
-                                except ValueError:
-                                    pass
-                            if addr.Next:
-                                addr = addr.Next.contents
-                            else:
-                                break
-                        if current.contents.Next:
-                            current = current.contents.Next.contents
+        iphlpapi = ctypes.windll.iphlpapi
+        size = wintypes.ULONG(0)
+        ret = iphlpapi.GetAdaptersInfo(None, ctypes.byref(size))
+        if ret == 111:  # ERROR_BUFFER_OVERFLOW
+            buffer = ctypes.create_string_buffer(size.value)
+            adapter_ptr = ctypes.cast(buffer, ctypes.POINTER(_IP_ADAPTER_INFO))
+            ret = iphlpapi.GetAdaptersInfo(adapter_ptr, ctypes.byref(size))
+            if ret == 0:  # NO_ERROR
+                current = adapter_ptr
+                while current:
+                    info = current.contents
+                    gateway = ""
+                    gw = info.GatewayList
+                    gw_ip = gw.IpAddress.decode("ascii", errors="ignore").strip("\x00")
+                    if gw_ip and gw_ip != "0.0.0.0":
+                        gateway = gw_ip
+                    addr = info.IpAddressList
+                    while True:
+                        ip_str = addr.IpAddress.decode("ascii", errors="ignore").strip("\x00")
+                        mask_str = addr.IpMask.decode("ascii", errors="ignore").strip("\x00")
+                        if ip_str and mask_str and ip_str != "0.0.0.0":
+                            try:
+                                ip_obj = ipaddress.ip_address(ip_str)
+                                mask_obj = ipaddress.ip_address(mask_str)
+                                if ip_obj.version == 4 and mask_obj.version == 4:
+                                    # Calculate prefix length from mask
+                                    mask_int = int(mask_obj)
+                                    prefix_len = bin(mask_int).count("1")
+                                    network = ipaddress.ip_network(f"{ip_str}/{prefix_len}", strict=False)
+                                    results.append((ip_str, mask_str, str(network.broadcast_address), gateway))
+                            except ValueError:
+                                pass
+                        if addr.Next:
+                            addr = addr.Next.contents
                         else:
                             break
-        except Exception:
-            pass
-    else:
-        # Linux/Mac: try netifaces if available, else fall back
+                    current = info.Next
+    except Exception:
+        pass
+    return results
+
+
+def get_interface_subnet_info() -> list[tuple[str, str, str]]:
+    """Returns list of (ip_address, subnet_mask, broadcast_address) tuples from actual OS network config."""
+    if sys.platform.startswith("win"):
+        return [(ip, mask, bcast) for ip, mask, bcast, _gateway in _windows_adapters()]
+
+    # Linux/Mac: try netifaces if available, else fall back
+    results: list[tuple[str, str, str]] = []
+    try:
+        import fcntl
+        import struct
+        SIOCGIFNETMASK = 0x891B
+        SIOCGIFBRDADDR = 0x8919
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            import fcntl
-            import struct
-            SIOCGIFNETMASK = 0x891B
-            SIOCGIFBRDADDR = 0x8919
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                for ifname in socket.if_nameindex():
-                    name = ifname[1]
+            for ifname in socket.if_nameindex():
+                name = ifname[1]
+                try:
+                    ifreq = struct.pack("256s", name[:15].encode("utf-8"))
+                    mask_raw = fcntl.ioctl(sock.fileno(), SIOCGIFNETMASK, ifreq)
+                    mask = socket.inet_ntoa(mask_raw[20:24])
+                    brd_raw = fcntl.ioctl(sock.fileno(), SIOCGIFBRDADDR, ifreq)
+                    brd = socket.inet_ntoa(brd_raw[20:24])
+                    # Get IP via getsockname-like approach or just use the interface
                     try:
-                        ifreq = struct.pack("256s", name[:15].encode("utf-8"))
-                        mask_raw = fcntl.ioctl(sock.fileno(), SIOCGIFNETMASK, ifreq)
-                        mask = socket.inet_ntoa(mask_raw[20:24])
-                        brd_raw = fcntl.ioctl(sock.fileno(), SIOCGIFBRDADDR, ifreq)
-                        brd = socket.inet_ntoa(brd_raw[20:24])
-                        # Get IP via getsockname-like approach or just use the interface
-                        try:
-                            ip_raw = fcntl.ioctl(sock.fileno(), 0x8915, ifreq)  # SIOCGIFADDR
-                            ip = socket.inet_ntoa(ip_raw[20:24])
-                        except OSError:
-                            ip = ""
-                        if ip and ip != "0.0.0.0" and mask != "0.0.0.0" and not ip.startswith("127."):
-                            results.append((ip, mask, brd))
+                        ip_raw = fcntl.ioctl(sock.fileno(), 0x8915, ifreq)  # SIOCGIFADDR
+                        ip = socket.inet_ntoa(ip_raw[20:24])
                     except OSError:
-                        continue
-            finally:
-                sock.close()
-        except (ImportError, OSError):
-            pass
+                        ip = ""
+                    if ip and ip != "0.0.0.0" and mask != "0.0.0.0" and not ip.startswith("127."):
+                        results.append((ip, mask, brd))
+                except OSError:
+                    continue
+        finally:
+            sock.close()
+    except (ImportError, OSError):
+        pass
 
     return results
 
